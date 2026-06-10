@@ -1,0 +1,6 @@
+Flask==2.3.3
+selenium==4.15.0
+pymongo==4.5.0
+webdriver-manager==4.0.1
+requests==2.31.0
+gunicorn==21.2.0
