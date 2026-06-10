@@ -46,11 +46,8 @@ DAYS_AHEAD              = 60        # how far ahead to scan for fixtures
 MATCH_DURATION_MINS     = 120
 DAILY_MAX_DAYS          = 60
 DAILY_MAX_MISSES        = 7
+DATABASE_URL = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 
-DATABASE_URL = os.getenv(
-    "MONGO_URI",
-    "mongodb+srv://engineercapiyo_db_user:Henrique2026Dembele@cluster0.omepeze.mongodb.net/clashdb?retryWrites=true&w=majority",
-)
 DB_NAME         = "clashdb"
 COLLECTION_NAME = "fixtures"        # World Cup goes into its own collection
 
@@ -59,7 +56,7 @@ SOFASCORE_API  = "https://api.sofascore.com/api/v1"
 SOFASCORE_HOME = "https://www.sofascore.com"
 DEFAULT_ODDS   = {"home_win": 2.50, "away_win": 2.80, "draw": 3.20}
 
-FANCLASH_API = os.environ.get("FANCLASH_API", "https://fanclash-api.onrender.com/api")
+FANCLASH_API = os.environ.get("FANCLASH_API")
 
 POLL_INTERVAL_SEC        = 45
 LINEUP_POLL_INTERVAL_SEC = 30
