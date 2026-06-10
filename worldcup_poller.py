@@ -16,7 +16,6 @@ Fixes carried over from live_poller.py:
 Install:  pip install curl_cffi pymongo requests python-dotenv
 Run:      python worldcup_poller.py
 """
-
 import time
 import hashlib
 import random
@@ -768,7 +767,91 @@ def send_commentary(fixture: dict, commentary_data: dict):
 # ─────────────────────────────────────────────────────────────────────────────
 # LINEUP FETCHER
 # ─────────────────────────────────────────────────────────────────────────────
+def fetch_and_forward_statistics(
+    session: cffi_requests.Session,
+    fixture: dict,
+    live_data: dict,
+) -> cffi_requests.Session:
+    sofascore_id = fixture.get("sofascore_id")
+    match_id     = fixture["match_id"]
+    label        = f"{fixture['home_team']} vs {fixture['away_team']}"
 
+    if not sofascore_id:
+        return session
+
+    data, session = api_get(session, f"/event/{sofascore_id}/statistics")
+    if not data:
+        logger.warning(f"   No statistics for {label}")
+        return session
+
+    time_elapsed = live_data.get("time_elapsed", 0)
+    time_extra   = live_data.get("time_extra", 0)
+    minute_disp  = f"{time_elapsed}" + (f"+{time_extra}" if time_extra else "")
+
+    # Sofascore statistics come as a list of groups, each with statisticsItems
+    # e.g. groups: [{groupName: "Ball possession", statisticsItems: [{name, home, away}]}]
+    def extract(groups: list, name: str, default: int = 0) -> int:
+        for group in groups:
+            for item in group.get("statisticsItems", []):
+                if item.get("name", "").lower() == name.lower():
+                    # values come as "45%" or "5" — strip % and cast
+                    try:
+                        return int(str(item.get("home", default)).replace("%", "").strip())
+                    except (ValueError, TypeError):
+                        return default
+        return default
+
+    def extract_away(groups: list, name: str, default: int = 0) -> int:
+        for group in groups:
+            for item in group.get("statisticsItems", []):
+                if item.get("name", "").lower() == name.lower():
+                    try:
+                        return int(str(item.get("away", default)).replace("%", "").strip())
+                    except (ValueError, TypeError):
+                        return default
+        return default
+
+    groups = data.get("statistics", [{}])[0].get("groups", [])
+
+    payload = {
+        "match_id":              match_id,
+        "minute":                time_elapsed,
+        "minute_display":        minute_disp,
+        "home_score":            live_data.get("home_score", 0),
+        "away_score":            live_data.get("away_score", 0),
+        "ball_possession_home":  extract(groups, "Ball possession"),
+        "ball_possession_away":  extract_away(groups, "Ball possession"),
+        "total_shots_home":      extract(groups, "Total shots"),
+        "total_shots_away":      extract_away(groups, "Total shots"),
+        "shots_on_target_home":  extract(groups, "Shots on target"),
+        "shots_on_target_away":  extract_away(groups, "Shots on target"),
+        "corners_home":          extract(groups, "Corner kicks"),
+        "corners_away":          extract_away(groups, "Corner kicks"),
+        "fouls_home":            extract(groups, "Fouls"),
+        "fouls_away":            extract_away(groups, "Fouls"),
+        "offsides_home":         extract(groups, "Offsides"),
+        "offsides_away":         extract_away(groups, "Offsides"),
+        "yellow_cards_home":     extract(groups, "Yellow cards"),
+        "yellow_cards_away":     extract_away(groups, "Yellow cards"),
+        "red_cards_home":        extract(groups, "Red cards"),
+        "red_cards_away":        extract_away(groups, "Red cards"),
+        "pass_accuracy_home":    extract(groups, "Passes %"),
+        "pass_accuracy_away":    extract_away(groups, "Passes %"),
+        "timestamp":             datetime.now(timezone.utc).isoformat(),
+    }
+
+    try:
+        r = std_requests.post(
+            f"{FANCLASH_API}/games/statistics", json=payload, timeout=5
+        )
+        if r.status_code == 200:
+            logger.info(f"📊 Statistics forwarded for {label} ({minute_disp}')")
+        else:
+            logger.warning(f"❌ Statistics failed: {r.status_code}")
+    except Exception as e:
+        logger.error(f"fetch_and_forward_statistics error: {e}")
+
+    return session
 def fetch_and_forward_lineups(
     session: cffi_requests.Session,
     fixture: Dict,
@@ -1020,6 +1103,7 @@ def poll_live_game(
     full_time_sent   = False
     second_half_sent = False
     seen_incidents: set = set()
+    poll_count       = 0
 
     while True:
         live, session = fetch_live_data(session, sofascore_id)
@@ -1200,6 +1284,8 @@ def poll_live_game(
                 "event_type": "half_time",
                 "home_score": home_score, "away_score": away_score,
             })
+            # Fetch statistics at half time
+            session = fetch_and_forward_statistics(session, fixture, live)
             half_time_sent = True
 
         if status_type == "inprogress" and half_time_sent and not second_half_sent:
@@ -1240,9 +1326,17 @@ def poll_live_game(
                 "event_type": "full_time",
                 "home_score": home_score, "away_score": away_score,
             })
+            # Final statistics snapshot at full time
+            session = fetch_and_forward_statistics(session, fixture, live)
             move_completed_game_to_history(col, history_col, match_id)
             full_time_sent = True
             break
+
+        # ── Periodic statistics every 5 polls (~225s) ─────────────────────
+        poll_count += 1
+        if poll_count % 5 == 0:
+            logger.info(f"📊 Fetching statistics snapshot at {minute_disp}' for {label}")
+            session = fetch_and_forward_statistics(session, fixture, live)
 
         time.sleep(POLL_INTERVAL_SEC)
 
