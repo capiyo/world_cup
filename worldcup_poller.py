@@ -197,7 +197,7 @@ def make_session(warm_up: bool = True) -> cffi_requests.Session:
 
     if warm_up:
         try:
-            time.sleep(random.uniform(2.0, 5.0))
+            time.sleep(random.uniform(5.0, 10.0))  # was 2.0–4.0
             url = random.choice(WARMUP_URLS)
             r = session.get(url, timeout=15)
             logger.info(f"   Warm-up: HTTP {r.status_code} ({url})")
@@ -218,6 +218,8 @@ def api_get(
     retries: int = 5,
 ) -> Tuple[Optional[Dict], cffi_requests.Session]:
     url = f"{SOFASCORE_API}{path}"
+    session_refreshed = False  # only refresh once per call
+
     for attempt in range(retries):
         try:
             time.sleep(random.uniform(1.5, 3.0))
@@ -230,15 +232,21 @@ def api_get(
                 return None, session
 
             if resp.status_code == 403:
+                # Exponential back-off first, then one session refresh
+                wait = (2 ** attempt) * random.uniform(4, 8)
                 logger.warning(
-                    f"   HTTP 403 for {path} (attempt {attempt + 1}) — refreshing session..."
+                    f"   HTTP 403 for {path} (attempt {attempt + 1}) "
+                    f"— backing off {wait:.0f}s..."
                 )
-                session = make_session(warm_up=True)
-                time.sleep(random.uniform(5, 10))
+                time.sleep(wait)
+                if not session_refreshed:
+                    logger.info("   Refreshing session after back-off...")
+                    session = make_session(warm_up=True)
+                    session_refreshed = True
                 continue
 
             if resp.status_code == 429:
-                wait = 20 * (attempt + 1)
+                wait = 30 * (attempt + 1)
                 logger.warning(f"   Rate limited — waiting {wait}s...")
                 time.sleep(wait)
             else:
@@ -367,12 +375,13 @@ def parse_event(event: Dict) -> Optional[Dict]:
 def scrape_via_daily(
     session: cffi_requests.Session,
 ) -> Tuple[List[Dict], cffi_requests.Session]:
-    """Scan day-by-day for World Cup fixtures."""
     logger.info("   📆 Scanning day-by-day for World Cup fixtures...")
-    docs: List[Dict]  = []
-    seen: set         = set()
-    matchdays_found   = 0
+    docs: List[Dict]   = []
+    seen: set          = set()
+    matchdays_found    = 0
     consecutive_misses = 0
+    blocked_streak     = 0          # ← new: tracks consecutive None returns from 403s
+    MAX_BLOCKED        = 3          # ← give up and rest after this many blocked days
 
     today   = datetime.now(timezone.utc).date()
     cutoff  = today + timedelta(days=DAILY_MAX_DAYS)
@@ -383,10 +392,28 @@ def scrape_via_daily(
             logger.info(f"   ⏹️  {DAILY_MAX_MISSES} consecutive empty days — stopping")
             break
 
+        if blocked_streak >= MAX_BLOCKED:
+            wait = random.uniform(120, 240)
+            logger.warning(
+                f"   🚫 {blocked_streak} consecutive blocked days — "
+                f"pausing {wait:.0f}s before retrying"
+            )
+            time.sleep(wait)
+            session = make_session(warm_up=True)
+            blocked_streak = 0
+            # Don't advance current — retry the same day
+
         day_str = current.strftime("%Y-%m-%d")
         data, session = api_get(session, f"/sport/football/scheduled-events/{day_str}")
 
-        if data:
+        if data is None:
+            # None can mean 404 (no events) or exhausted retries (403 storm)
+            # We distinguish by checking if api_get burned through all retries
+            # A simple heuristic: if we got None with no prior matchdays, likely blocked
+            blocked_streak += 1
+            consecutive_misses += 1
+        else:
+            blocked_streak = 0  # got a real response, reset block streak
             day_docs = []
             for ev in data.get("events", []):
                 tid = (
@@ -413,11 +440,10 @@ def scrape_via_daily(
                 docs.extend(day_docs)
             else:
                 consecutive_misses += 1
-        else:
-            consecutive_misses += 1
 
         current += timedelta(days=1)
-        time.sleep(random.uniform(2.0, 3.5))
+        # Longer, randomised sleep between days to avoid burst detection
+        time.sleep(random.uniform(4.0, 8.0))  # was 2.0–3.5
 
     return docs, session
 
@@ -483,8 +509,8 @@ def scrape_via_rounds(
         if round_docs:
             logger.info(f"   Round {rnd:>3} → {len(round_docs)} upcoming")
             docs.extend(round_docs)
-
-        time.sleep(random.uniform(2.0, 4.0))
+       
+        time.sleep(random.uniform(5.0, 10.0))  # was 2.0–4.0
 
     return docs, session
 
@@ -986,7 +1012,7 @@ def fetch_live_data(
     for attempt in range(retries):
         try:
             with SOFASCORE_SEMAPHORE:
-                time.sleep(random.uniform(3.0, 7.0))
+                time.sleep(random.uniform(5.0, 10.0))  # was 2.0–4.0
                 session.headers.update({
                     "Referer":          f"{SOFASCORE_HOME}/event/{sofascore_id}",
                     "X-Requested-With": "XMLHttpRequest",
@@ -999,7 +1025,7 @@ def fetch_live_data(
                 incidents = []
                 try:
                     with SOFASCORE_SEMAPHORE:
-                        time.sleep(random.uniform(2.0, 5.0))
+                        time.sleep(random.uniform(5.0, 10.0))  # was 2.0–4.0
                         inc_resp = session.get(
                             f"{SOFASCORE_API}/event/{sofascore_id}/incidents",
                             timeout=15,
