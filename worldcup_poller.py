@@ -404,7 +404,7 @@ def scrape_via_daily(
             # Don't advance current — retry the same day
 
         day_str = current.strftime("%Y-%m-%d")
-        data, session = api_get(session, f"/sport/football/scheduled-events/{day_str}")
+        data, session = api_get(session, f"/sport/football/events/{day_str}")
 
         if data is None:
             # None can mean 404 (no events) or exhausted retries (403 storm)
@@ -525,17 +525,21 @@ def run_scraper(col) -> List[Dict]:
     logger.info("=" * 65)
 
     session = make_session(warm_up=True)
+    docs: List[Dict] = []
 
-    # Try rounds first; fall back to daily if no results
+    # Primary: rounds endpoint (correct, proven to work)
     season_id, session = get_current_season(session)
-    docs: List[Dict]   = []
 
     if season_id:
         logger.info(f"   Season ID detected: {season_id}")
         docs, session = scrape_via_rounds(session, season_id)
+    else:
+        logger.warning("   Could not detect season ID")
 
+    # Fallback: daily scan using the CORRECT /events/ endpoint
+    # (not /scheduled-events/ which is an HTML page path, not an API path)
     if not docs:
-        logger.info("   Rounds returned nothing — falling back to day-by-day scan")
+        logger.info("   Rounds returned nothing — falling back to /sport/football/events/{date}")
         docs, session = scrape_via_daily(session)
 
     if docs and col is not None:
