@@ -303,7 +303,7 @@ def ss_make_session(warm_up: bool = True) -> cffi_requests.Session:
 def ss_api_get(
     session: cffi_requests.Session,
     path: str,
-    retries: int = 5,
+    retries: int = 2,
 ) -> Tuple[Optional[Dict], cffi_requests.Session]:
     url              = f"{SS_API}{path}"
     refreshed_once   = False
@@ -502,19 +502,18 @@ def ss_scrape_via_daily(
 
 
 def ss_run_scraper() -> List[Dict]:
-    """Run Sofascore scraper. Returns fixture list (empty on failure/block)."""
     logger.info("   📡 Sofascore scraper starting...")
-    session           = ss_make_session(warm_up=True)
+    session = ss_make_session(warm_up=True)
     season_id, session = ss_get_current_season(session)
 
     if season_id:
-        logger.info(f"   SS: season_id={season_id}")
         docs, _ = ss_scrape_via_rounds(session, season_id)
     else:
-        docs = []
+        # season_id is None → SS is blocked, don't bother with daily scan
+        logger.warning("   SS: could not get season — likely blocked, skipping daily scan")
+        return []   # ← triggers failover to Flashscore immediately
 
     if not docs:
-        logger.info("   SS: rounds empty — falling back to daily scan")
         docs, _ = ss_scrape_via_daily(session)
 
     logger.info(f"   SS: got {len(docs)} fixtures")
@@ -566,7 +565,7 @@ def _fs_reset_session():
     logger.info("   FS: session reset")
 
 
-def fs_get(query: str, retries: int = 5, base_delay: float = 2.0) -> Optional[str]:
+def fs_get(query: str, retries: int = 2, base_delay: float = 2.0) -> Optional[str]:
     url              = f"{FS_FEED_BASE}{query}"
     reset_done       = False
 
@@ -1357,7 +1356,7 @@ def fetch_and_forward_statistics(fixture: dict, live_data: dict):
 def ss_fetch_live_data(
     session: cffi_requests.Session,
     sofascore_id: int,
-    retries: int = 4,
+    retries: int = 2,
 ) -> Tuple[Optional[dict], cffi_requests.Session]:
     url = f"{SS_API}/event/{sofascore_id}"
     for attempt in range(retries):
@@ -1990,8 +1989,13 @@ def main():
                 sleep_secs = LINEUP_POLL_INTERVAL_SEC
                 logger.info(f"⏳ Checking every {sleep_secs}s — {int(closest_mins)} mins to kickoff")
             elif closest_mins <= 1440:
-                sleep_secs = HOUR_CHECK_INTERVAL_SEC
-                logger.info(f"📅 Next game in {int(closest_mins/60)}h — waking hourly")
+                # Sleep until 1 hour before the next game, minimum 60s
+                sleep_secs = max(60, int((closest_mins - 60) * 60))
+                wake_at    = (datetime.now(timezone.utc) + timedelta(seconds=sleep_secs) + NAIROBI_OFFSET).strftime("%H:%M")
+                logger.info(
+                    f"📅 Next game in {int(closest_mins / 60)}h {int(closest_mins % 60)}m — "
+                    f"sleeping until {wake_at} EAT (1h before kickoff)"
+                )
             else:
                 sleep_secs = 3600
 
@@ -2003,6 +2007,10 @@ def main():
         except Exception as e:
             logger.error(f"Main loop error: {e}", exc_info=True)
             time.sleep(60)
+
+    if mongo_client:
+        mongo_client.close()
+        logger.info("🔌 MongoDB closed")
 
     if mongo_client:
         mongo_client.close()
