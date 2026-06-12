@@ -71,6 +71,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests as std_requests
 from pymongo import MongoClient
 from dotenv import load_dotenv
+import socket
+
+# Monkey-patch DNS so global.flashscore.ninja always resolves to the known IP
+_orig_getaddrinfo = socket.getaddrinfo
+
+def _patched_getaddrinfo(host, port, *args, **kwargs):
+    if host == "global.flashscore.ninja":
+        host = "34.8.77.207"
+    return _orig_getaddrinfo(host, port, *args, **kwargs)
+
+socket.getaddrinfo = _patched_getaddrinfo
 
 load_dotenv()
 
