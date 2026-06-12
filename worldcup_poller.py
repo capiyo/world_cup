@@ -34,7 +34,7 @@ import logging
 import os
 import re
 import threading
-import queue
+import queue as _queue
 
 import json
 from http.server import HTTPServer, BaseHTTPRequestHandler
