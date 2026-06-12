@@ -88,7 +88,7 @@ X_FSIGN_TOKEN       = "SW9D1eZo"
 MATCH_DURATION_MINS = 120
 DATABASE_URL        = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME             = "clashdb"
-COLLECTION_NAME     = "fixturexi"
+COLLECTION_NAME     = "fixtures"
 NAIROBI_OFFSET      = timedelta(hours=3)
 
 FANCLASH_API        = os.environ.get("FANCLASH_API")
