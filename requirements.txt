@@ -6,3 +6,4 @@ requests==2.31.0
 gunicorn==21.2.0
 curl_cffi>=0.5.10
 python-dotenv>=1.0.0
+beautifulsoup4==4.12.3
