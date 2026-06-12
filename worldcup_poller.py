@@ -88,7 +88,7 @@ X_FSIGN_TOKEN       = "SW9D1eZo"
 MATCH_DURATION_MINS = 120
 DATABASE_URL        = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 DB_NAME             = "clashdb"
-COLLECTION_NAME     = "fixturexi"
+COLLECTION_NAME     = "fixtures"
 NAIROBI_OFFSET      = timedelta(hours=3)
 
 FANCLASH_API        = os.environ.get("FANCLASH_API")
@@ -378,6 +378,15 @@ def parse_schedule_feed(raw: str, upcoming_only: bool = True) -> List[Dict]:
     """
     Parse to_{stage}_{season}_{page} response.
     Match rows are identified by LME÷ (match id).
+
+    Key fields:
+      LME = match_id
+      LMJ = home team name
+      LMK = away team name
+      LMC = kickoff timestamp
+      LMS = status string  (? = upcoming)
+      LMF = home score (empty if not started)
+      AU  = away score (empty if not started)
     """
     docs: List[Dict] = []
     if not raw:
@@ -422,6 +431,15 @@ def parse_today_feed(raw: str, upcoming_only: bool = True) -> List[Dict]:
     """
     Parse t_1_8_{WC_ID}_3_en_{page} response (today's matches only).
     Match rows are identified by AA÷ (match id).
+
+    Key fields:
+      AA = match_id
+      CX = home team name
+      AE = away team name
+      AD = kickoff timestamp
+      AB = status code  (1=upcoming 2=1H 3=HT 4=2H 7=FT 8=AET 9=AP)
+      AG = home score
+      AH = away score
     """
     docs: List[Dict] = []
     if not raw:
@@ -490,6 +508,7 @@ def parse_live_feed(raw: str) -> Optional[Dict]:
         home_score = _safe_int(f.get("AG", "")) or 0
         away_score = _safe_int(f.get("AH", "")) or 0
 
+        # Time elapsed — try several field codes Flashscore uses
         time_elapsed = 0
         for tf in ("BC", "BD", "BF", "BG"):
             v = f.get(tf, "").strip()
@@ -519,6 +538,10 @@ def parse_live_feed(raw: str) -> Optional[Dict]:
 def parse_incidents_feed(raw: str) -> List[Dict]:
     """
     Parse d_hb_{match_id} incidents feed.
+    Incident rows start with INC÷.
+
+    Format: INC÷<id>÷<type>÷<minute>÷<extra>÷<is_home>÷<player>÷[<assist_or_sub_out>]÷
+    Types:  G=goal  YC=yellow  RC=red  SB=substitution  MS=missed_pen  PEN=penalty  CO=corner
     """
     incidents: List[Dict] = []
     if not raw:
@@ -526,9 +549,16 @@ def parse_incidents_feed(raw: str) -> List[Dict]:
 
     for row in raw.split("~"):
         row = row.strip()
-        if not row or "INC÷" not in row:
+        if not row:
             continue
 
+        # Incidents live in rows starting with INC÷ (after stripping the row prefix)
+        # The actual row may be part of a ¬-delimited block, find INC fields
+        if "INC÷" not in row:
+            continue
+
+        # Extract all INC blocks from the row
+        # Each ¬-segment that starts with INC÷ is one incident
         for segment in row.split("¬"):
             if not segment.startswith("INC÷"):
                 continue
@@ -556,6 +586,11 @@ def parse_incidents_feed(raw: str) -> List[Dict]:
 def parse_lineups_feed(raw: str) -> Optional[Dict]:
     """
     Parse li_{match_id}_1_en lineups feed.
+
+    Row prefixes:
+      LU÷<home_formation>÷<away_formation>÷
+      PL÷<id>÷<name>÷<jersey>÷<pos>÷<is_home:1/0>÷<is_starter:1/0>÷[captain:1]÷
+      CO÷<id>÷<name>÷<is_home:1/0>÷
     """
     if not raw:
         return None
@@ -684,6 +719,7 @@ def parse_statistics_feed(
 def _get_season_stage_ids() -> Tuple[Optional[str], Optional[str]]:
     """
     Fetch the tournament header row to extract season_id (ZC) and stage_id (ZE).
+    These are needed to build the to_{stage}_{season}_{page} schedule endpoints.
     """
     raw = fs_get(f"t_1_8_{WC_TOURNAMENT_ID}_3_en_1", base_delay=2.0)
     if not raw:
@@ -709,6 +745,7 @@ def run_scraper(col) -> List[Dict]:
     docs: List[Dict] = []
     seen: set        = set()
 
+    # ── Primary path: to_{stage}_{season}_{page} — full schedule ─────────────
     season_id, stage_id = _get_season_stage_ids()
 
     if season_id and stage_id:
@@ -735,6 +772,7 @@ def run_scraper(col) -> List[Dict]:
     else:
         logger.warning("   season_id/stage_id not found — skipping schedule pages")
 
+    # ── Fallback: today's t_ endpoint (only returns today's matches) ──────────
     if not docs:
         logger.info("   Falling back to today's t_ endpoint...")
         for page in range(1, 6):
@@ -752,26 +790,12 @@ def run_scraper(col) -> List[Dict]:
                 break
             time.sleep(random.uniform(2.0, 3.5))
 
+    # ── Persist to MongoDB ─────────────────────────────────────────────────────
     if docs and col is not None:
         saved = 0
         for d in docs:
             try:
-                # FIX: on scrape, never overwrite status of a game that is
-                # genuinely upcoming (kickoff in future). This prevents the
-                # scraper from re-marking a DB-live record back to "upcoming"
-                # mid-match, or vice versa stamping "live" on a future game.
-                existing = col.find_one({"_id": d["_id"]}, {"status": 1, "_kickoff_ts": 1})
-                if existing:
-                    # Only overwrite status if we have a better ground-truth
-                    # (scraped data says completed, or DB record is stale-live
-                    # and kickoff hasn't happened yet).
-                    col.update_one(
-                        {"_id": d["_id"]},
-                        {"$set": {k: v for k, v in d.items() if k != "status"}},
-                        upsert=True,
-                    )
-                else:
-                    col.update_one({"_id": d["_id"]}, {"$set": d}, upsert=True)
+                col.update_one({"_id": d["_id"]}, {"$set": d}, upsert=True)
                 saved += 1
             except Exception:
                 pass
@@ -814,53 +838,6 @@ def get_history_collection(client):
     hcol.create_index("completed_at")
     hcol.create_index("match_id")
     return hcol
-
-
-def repair_stale_live_records(col):
-    """
-    FIX: On startup, reset any DB records that are marked 'live' or 'soon'
-    but whose kickoff timestamp is in the future. These are stale records
-    from a previous run that crashed or was restarted before the game started.
-    """
-    if col is None:
-        return
-    now_utc = datetime.now(timezone.utc)
-    repaired = 0
-    try:
-        for doc in col.find({"status": {"$in": ["live", "soon"]}, "league": WORLD_CUP_LABEL}):
-            date_iso = doc.get("date_iso", "")
-            time_str = doc.get("time", "")
-            if not date_iso or not time_str or time_str == "TBD":
-                continue
-            try:
-                naive_eat   = datetime.strptime(f"{date_iso} {time_str}", "%Y-%m-%d %H:%M")
-                kickoff_utc = (naive_eat - NAIROBI_OFFSET).replace(tzinfo=timezone.utc)
-            except Exception:
-                continue
-
-            if kickoff_utc > now_utc:
-                # Kickoff is in the future — this status is stale
-                col.update_one(
-                    {"_id": doc["_id"]},
-                    {"$set": {
-                        "status":               "upcoming",
-                        "is_live":              False,
-                        "available_for_voting": True,
-                    }}
-                )
-                logger.warning(
-                    f"🔧 Repaired stale '{doc['status']}' → 'upcoming': "
-                    f"{doc.get('home_team')} vs {doc.get('away_team')} "
-                    f"(kickoff {kickoff_utc.strftime('%Y-%m-%d %H:%M')} UTC)"
-                )
-                repaired += 1
-    except Exception as e:
-        logger.error(f"repair_stale_live_records error: {e}")
-
-    if repaired:
-        logger.info(f"🔧 Repaired {repaired} stale live/soon records")
-    else:
-        logger.info("✅ No stale live records found")
 
 
 def move_completed_game_to_history(col, history_col, match_id: str) -> bool:
@@ -954,28 +931,16 @@ def update_db_status(col, match_id: str, status: str, extra_fields: Optional[dic
 
 
 def get_live_fixtures(fixtures: List[Dict]) -> List[Dict]:
-    """
-    FIX: Only return fixtures that are genuinely live — i.e. the wall-clock
-    time is at or past the kickoff timestamp. This prevents a stale DB status
-    of 'live' from triggering polling for a game that hasn't kicked off yet.
-    """
     now_utc = datetime.now(timezone.utc)
-    result  = []
-    for f in fixtures:
-        ko = f.get("_kickoff_utc")
-
-        # If we have a kickoff time and it's still in the future, never live
-        if ko and now_utc < ko:
-            continue
-
-        if f.get("status") in ("live",) or (
-            ko
-            and now_utc >= ko
-            and f.get("status") not in ("completed",)
-        ):
-            result.append(f)
-
-    return result
+    return [
+        f for f in fixtures
+        if f.get("status") == "live"
+        or (
+            f.get("_kickoff_utc")
+            and now_utc >= f["_kickoff_utc"]
+            and f.get("status") != "completed"
+        )
+    ]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1162,21 +1127,6 @@ def poll_live_game(fixture: dict, col, history_col):
         logger.error(f"❌ No flashscore_id for {label}")
         return
 
-    # ── Sanity check: don't poll if kickoff hasn't happened yet ──────────────
-    ko = fixture.get("_kickoff_utc")
-    if ko:
-        now_utc      = datetime.now(timezone.utc)
-        mins_to_kick = (ko - now_utc).total_seconds() / 60
-        if mins_to_kick > 5:
-            logger.warning(
-                f"⏭  Skipping poll for {label} — kickoff in {int(mins_to_kick)} mins "
-                f"(not live yet). DB status was '{fixture.get('status')}'."
-            )
-            # Repair DB status if it was stale
-            if fixture.get("status") in ("live", "soon") and mins_to_kick > 30:
-                update_db_status(col, match_id, "upcoming")
-            return
-
     # Check if already finished before starting poll loop
     initial = parse_live_feed(fs_get(f"dc_{fs_id}", base_delay=3.0))
     if initial and initial["status"] == "completed":
@@ -1318,6 +1268,7 @@ def poll_live_game(fixture: dict, col, history_col):
                 })
 
         # ── Match phases ───────────────────────────────────────────────────
+        # status_code 3 = HT pause
         if status_code == 3 and not half_time_sent:
             logger.info(f"⏸  HALF TIME: {home_score}–{away_score}")
             forward_event(fixture, "half_time", {
@@ -1333,6 +1284,7 @@ def poll_live_game(fixture: dict, col, history_col):
             fetch_and_forward_statistics(fixture, live)
             half_time_sent = True
 
+        # status_code 4 = second half in progress
         if status_code == 4 and half_time_sent and not second_half_sent:
             logger.info("▶️  SECOND HALF STARTED")
             forward_event(fixture, "second_half", {
@@ -1378,12 +1330,12 @@ def poll_live_game(fixture: dict, col, history_col):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# POLL QUEUE — single worker thread, auto-restarts on crash
+# POLL QUEUE — single-threaded, one pipeline at a time
 # ─────────────────────────────────────────────────────────────────────────────
 
-_poll_queue:           _queue.Queue  = _queue.Queue()
-_queue_worker_thread:  Optional[threading.Thread] = None
-_queue_lock:           threading.Lock = threading.Lock()
+_poll_queue:          _queue.Queue = _queue.Queue()
+_queue_worker_started: bool        = False
+_queue_lock:          threading.Lock = threading.Lock()
 
 
 def _queue_worker():
@@ -1399,7 +1351,6 @@ def _queue_worker():
 
             with polls_lock:
                 if match_id in active_polls:
-                    logger.debug(f"   Already polling {label} — skipping duplicate")
                     _poll_queue.task_done()
                     continue
                 active_polls.add(match_id)
@@ -1407,7 +1358,7 @@ def _queue_worker():
             try:
                 poll_live_game(fixture, col, history_col)
             except Exception as e:
-                logger.error(f"Poll error for {label}: {e}", exc_info=True)
+                logger.error(f"Poll error for {label}: {e}")
             finally:
                 with polls_lock:
                     active_polls.discard(match_id)
@@ -1416,32 +1367,23 @@ def _queue_worker():
         except _queue.Empty:
             continue
         except Exception as e:
-            logger.error(f"Queue worker unhandled error: {e}", exc_info=True)
-            # Don't exit — keep running
+            logger.error(f"Queue worker error: {e}")
 
 
 def _ensure_queue_worker():
-    """
-    FIX: Start the worker thread if it hasn't been started or if it has
-    died (e.g. due to an unhandled exception). This prevents silent hangs
-    where tasks pile up in the queue but nothing processes them.
-    """
-    global _queue_worker_thread
+    global _queue_worker_started
     with _queue_lock:
-        if _queue_worker_thread is None or not _queue_worker_thread.is_alive():
-            if _queue_worker_thread is not None:
-                logger.warning("⚠️  Poll queue worker died — restarting")
-            _queue_worker_thread = threading.Thread(
+        if not _queue_worker_started:
+            threading.Thread(
                 target=_queue_worker, daemon=True, name="wc-poll-worker"
-            )
-            _queue_worker_thread.start()
+            ).start()
+            _queue_worker_started = True
 
 
 def start_polling_for_game(fixture: dict, col, history_col):
     match_id = fixture["match_id"]
     with polls_lock:
         if match_id in active_polls:
-            logger.debug(f"   Already polling {fixture['home_team']} vs {fixture['away_team']}")
             return
     _ensure_queue_worker()
     _poll_queue.put((fixture, col, history_col))
@@ -1460,10 +1402,6 @@ def main():
     start_health_server()
     mongo_client, col = connect_db()
     history_col       = get_history_collection(mongo_client)
-
-    # FIX: Repair stale live/soon records before doing anything else.
-    # This is the primary fix for the "stuck live" bug seen in logs.
-    repair_stale_live_records(col)
 
     cleanup_all_completed_games(col, history_col)
 
@@ -1495,21 +1433,12 @@ def main():
                 cleanup_all_completed_games(col, history_col)
                 last_cleanup_time = time.time()
 
-            # FIX: Re-run stale record repair periodically in case a restart
-            # left new stale records (e.g. service bounced mid-match).
-            # Only do this check every 10 minutes to avoid spam.
-            if int(time.time()) % 600 < LIVE_CHECK_INTERVAL_SEC:
-                repair_stale_live_records(col)
-
             fixtures = load_fixtures_from_db(col)
             if not fixtures:
                 logger.warning("📭 No fixtures in DB — scraping now")
                 run_scraper(col)
                 last_scrape_time = time.time()
                 fixtures = load_fixtures_from_db(col)
-
-            # Ensure worker thread is alive every loop iteration
-            _ensure_queue_worker()
 
             # ── Live games ─────────────────────────────────────────────────
             live_fixtures = get_live_fixtures(fixtures)
