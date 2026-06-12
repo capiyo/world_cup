@@ -71,17 +71,9 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests as std_requests
 from pymongo import MongoClient
 from dotenv import load_dotenv
-import socket
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Monkey-patch DNS so global.flashscore.ninja always resolves to the known IP
-_orig_getaddrinfo = socket.getaddrinfo
-
-def _patched_getaddrinfo(host, port, *args, **kwargs):
-    if host == "global.flashscore.ninja":
-        host = "34.8.77.207"
-    return _orig_getaddrinfo(host, port, *args, **kwargs)
-
-socket.getaddrinfo = _patched_getaddrinfo
 
 load_dotenv()
 
@@ -93,7 +85,8 @@ WORLD_CUP_LABEL     = "World Cup 2026"
 WC_TOURNAMENT_ID    = "lvUBR5F8"          # Flashscore internal ID
 
 FS_NINJA_HOST       = "global.flashscore.ninja"
-FS_FEED_BASE        = f"https://{FS_NINJA_HOST}/2/x/feed/"
+#FS_FEED_BASE        = # Use IP directly — bypasses Render's DNS which can't resolve global.flashscore.ninja
+FS_FEED_BASE = "https://34.8.77.207/2/x/feed/"
 X_FSIGN_TOKEN       = "SW9D1eZo"
 
 MATCH_DURATION_MINS = 120
@@ -182,11 +175,14 @@ def _make_session() -> std_requests.Session:
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection":      "keep-alive",
+        "Host":            "global.flashscore.ninja",   # ← required for IP-direct requests
         "Referer":         "https://www.flashscore.com/",
         "Origin":          "https://www.flashscore.com",
         "User-Agent":      random.choice(USER_AGENTS),
         "X-Fsign":         X_FSIGN_TOKEN,
     })
+    # Disable SSL verification since cert is issued to hostname not IP
+    s.verify = False
     return s
 
 
