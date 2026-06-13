@@ -596,30 +596,35 @@ def get_lineup_poll_deadline(kickoff_utc: datetime) -> float:
     return deadline.timestamp()
 
 def poll_lineups_continuous(fixture: Dict, kickoff_utc: datetime):
-    """Continuously poll for lineups during the 58-53 minute window"""
+    """Poll for lineups continuously until found (or until match starts)"""
     match_id = fixture["match_id"]
     fs_id = fixture.get("flashscore_id") or match_id
     label = f"{fixture['home_team']} vs {fixture['away_team']}"
     
-    deadline = get_lineup_poll_deadline(kickoff_utc)
     poll_count = 0
+    start_time = datetime.now(timezone.utc)
     
-    logger.info(f"🔍 Starting lineup polling for {label} (window: {CONFIG.lineup_poll_start_min}-{CONFIG.lineup_poll_end_min} mins before)")
+    logger.info(f"🔍 Starting lineup polling for {label} - will poll every 30s until lineups are found")
     
     with lineup_polling_lock:
         lineup_polling_active[match_id] = True
     
     try:
-        while time.time() < deadline:
+        # Keep polling until we find lineups OR until match starts (10 minutes after kickoff)
+        while True:
             poll_count += 1
-            remaining = (deadline - time.time()) / 60
-            logger.info(f"📋 Lineup poll #{poll_count} for {label} ({remaining:.1f} min left)")
+            elapsed = (datetime.now(timezone.utc) - start_time).total_seconds() / 60
+            logger.info(f"📋 Lineup poll #{poll_count} for {label} (polling for {elapsed:.1f} minutes)")
             
+            # Fetch lineups
             raw = fs_get(f"li_{fs_id}_1_en", base_delay=1.0)
             if raw:
                 lineups = parse_lineups_feed(raw)
                 if lineups and (lineups["home"]["players"] or lineups["away"]["players"]):
-                    logger.info(f"✅ Lineups found for {label}!")
+                    logger.info(f"✅✅✅ LINEUPS FOUND for {label}! ✅✅✅")
+                    logger.info(f"   Home: {len(lineups['home']['players'])} players")
+                    logger.info(f"   Away: {len(lineups['away']['players'])} players")
+                    
                     if send_lineups(match_id, lineups):
                         # Update MongoDB
                         if fixture.get("_col"):
@@ -627,11 +632,18 @@ def poll_lineups_continuous(fixture: Dict, kickoff_utc: datetime):
                                 {"match_id": match_id},
                                 {"$set": {"lineups_fetched": True}}
                             )
+                        logger.info(f"🎉 Lineups successfully sent to backend for {label}")
                         return
             
+            # Check if match has started (10 minutes after kickoff)
+            if datetime.now(timezone.utc) > kickoff_utc + timedelta(minutes=10):
+                logger.warning(f"⚠️ Match started 10 minutes ago, stopping lineup polling for {label}")
+                break
+            
+            # Wait before next poll
             time.sleep(CONFIG.lineup_poll_interval_sec)
         
-        logger.info(f"⏰ Lineup polling window expired for {label}")
+        logger.warning(f"❌ No lineups found for {label} before match start")
     
     finally:
         with lineup_polling_lock:
@@ -1157,24 +1169,24 @@ def main():
             logger.info(f"   {minutes_until:.0f} minutes from now")
             
             # ============================================================
-            # LINEUP POLLING WINDOW (60 to 50 minutes before kickoff)
+            # LINEUP POLLING - Start early and poll until found
             # ============================================================
-            if 10 <= minutes_until <= 65:  # Start checking at 65 min, poll at 60 min
+            # Start polling at 90 minutes before kickoff
+            if minutes_until <= 90 and minutes_until > 0:
                 match_id = closest['match_id']
                 
-                # Start lineup polling at exactly 60 minutes before
-                if minutes_until <= 60 and match_id not in lineup_polling_started:
-                    if not closest.get("lineups_fetched"):
-                        logger.info(f"🎯 STARTING LINEUP POLLING for {closest['home_team']} vs {closest['away_team']}")
-                        logger.info(f"   {minutes_until:.0f} minutes until kickoff - polling every 30s")
-                        
-                        threading.Thread(
-                            target=poll_lineups_continuous,
-                            args=(closest, closest["_kickoff_utc"]),
-                            daemon=True
-                        ).start()
-                        
-                        lineup_polling_started.add(match_id)
+                # Only start if we haven't already started and lineups not yet fetched
+                if match_id not in lineup_polling_started and not closest.get("lineups_fetched"):
+                    logger.info(f"🎯 STARTING LINEUP POLLING for {closest['home_team']} vs {closest['away_team']}")
+                    logger.info(f"   {minutes_until:.0f} minutes until kickoff - will poll every 30s until lineups found")
+                    
+                    threading.Thread(
+                        target=poll_lineups_continuous,
+                        args=(closest, closest["_kickoff_utc"]),
+                        daemon=True
+                    ).start()
+                    
+                    lineup_polling_started.add(match_id)
             
             # ============================================================
             # MATCH START WINDOW (5 minutes before and after kickoff)
@@ -1202,7 +1214,12 @@ def main():
             # ============================================================
             # SMART SLEEP CALCULATION
             # ============================================================
-            sleep_seconds = calculate_sleep_duration(closest)
+            # If less than 90 minutes until match, sleep 30 seconds to poll frequently
+            if minutes_until <= 90:
+                sleep_seconds = 30
+            else:
+                sleep_seconds = calculate_sleep_duration(closest)
+            
             logger.info(f"💤 Sleeping for {sleep_seconds:.0f} seconds")
             time.sleep(sleep_seconds)
             
