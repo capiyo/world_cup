@@ -663,14 +663,31 @@ def poll_live_match(fixture: Dict):
         update_game_status(match_id, "completed")
         return
     
-    # Final lineup check
+    # FINAL LINEUP CHECK - Poll multiple times if needed
     if not fixture.get("lineups_fetched"):
-        logger.info(f"Final lineup check for {label}")
-        raw = fs_get(f"li_{fs_id}_1_en", base_delay=2.0)
-        if raw:
-            lineups = parse_lineups_feed(raw)
-            if lineups and (lineups["home"]["players"] or lineups["away"]["players"]):
-                send_lineups(match_id, lineups)
+        logger.info(f"📋 Final lineup check for {label} - polling for 3 minutes")
+        
+        # Poll for lineups for up to 3 minutes (6 attempts)
+        for attempt in range(6):
+            logger.info(f"   Lineup check attempt {attempt + 1}/6")
+            raw = fs_get(f"li_{fs_id}_1_en", base_delay=2.0)
+            if raw:
+                lineups = parse_lineups_feed(raw)
+                if lineups and (lineups["home"]["players"] or lineups["away"]["players"]):
+                    logger.info(f"✅ LINEUPS FOUND at kickoff for {label}!")
+                    if send_lineups(match_id, lineups):
+                        # Update MongoDB
+                        if fixture.get("_col"):
+                            fixture["_col"].update_one(
+                                {"match_id": match_id},
+                                {"$set": {"lineups_fetched": True}}
+                            )
+                        break
+            
+            if attempt < 5:  # Don't sleep after last attempt
+                time.sleep(30)
+        else:
+            logger.warning(f"⚠️ No lineups found for {label} after 3 minutes of polling")
     
     # Set live status
     update_game_status(match_id, "live", is_live=True)
@@ -683,11 +700,12 @@ def poll_live_match(fixture: Dict):
     second_half_sent = False
     seen_incidents = set()
     last_stats_time = time.time()
+    last_commentary_time = time.time()
     
     while True:
         try:
             # Fetch live data
-            live_raw = fs_get(f"dc_{fs_id}", base_delay=2.0)
+            live_raw = fs_get(f"dc_{fs_id}", base_delay=1.0)
             if not live_raw:
                 time.sleep(CONFIG.poll_interval_sec)
                 continue
@@ -698,7 +716,7 @@ def poll_live_match(fixture: Dict):
                 continue
             
             # Fetch incidents
-            incidents_raw = fs_get(f"d_hb_{fs_id}", base_delay=1.5)
+            incidents_raw = fs_get(f"d_hb_{fs_id}", base_delay=1.0)
             incidents = parse_incidents_feed(incidents_raw or "")
             
             home_score = live["home_score"]
@@ -771,11 +789,12 @@ def poll_live_match(fixture: Dict):
                     continue
                 seen_incidents.add(inc_id)
                 
+                # Prevent memory bloat
                 if len(seen_incidents) > 1000:
                     seen_incidents.clear()
                 
                 inc_type = inc["type"]
-                if inc_type == "G":
+                if inc_type == "G":  # Already handled goals
                     continue
                 
                 is_home = inc["is_home"]
@@ -785,6 +804,7 @@ def poll_live_match(fixture: Dict):
                 m_disp = f"{minute}" + (f"+{extra}" if extra else "")
                 player = inc.get("player", "Unknown")
                 
+                # Yellow Card
                 if inc_type == "YC":
                     send_live_update(match_id, "yellow_card", {
                         "minute": minute,
@@ -803,6 +823,7 @@ def poll_live_match(fixture: Dict):
                         "player": player,
                     })
                 
+                # Red Card
                 elif inc_type == "RC":
                     send_live_update(match_id, "red_card", {
                         "minute": minute,
@@ -821,6 +842,7 @@ def poll_live_match(fixture: Dict):
                         "player": player,
                     })
                 
+                # Substitution
                 elif inc_type == "SB":
                     p_out = inc.get("sub_out") or "Unknown"
                     send_live_update(match_id, "substitution", {
@@ -840,7 +862,7 @@ def poll_live_match(fixture: Dict):
                         "team": team,
                     })
             
-            # Half time
+            # Half Time
             if status_code == 3 and not half_time_sent:
                 logger.info(f"⏸ HALF TIME: {home_score}-{away_score}")
                 send_live_update(match_id, "half_time", {
@@ -866,7 +888,7 @@ def poll_live_match(fixture: Dict):
                     if stats:
                         send_statistics(match_id, stats)
             
-            # Second half start
+            # Second Half Start
             if status_code == 4 and half_time_sent and not second_half_sent:
                 logger.info("▶️ SECOND HALF STARTED")
                 send_live_update(match_id, "second_half", {
@@ -876,14 +898,14 @@ def poll_live_match(fixture: Dict):
                 send_commentary(match_id, {
                     "minute": time_elapsed,
                     "minute_display": f"{time_elapsed}'",
-                    "text": f"▶️ SECOND HALF UNDERWAY!",
+                    "text": "▶️ SECOND HALF UNDERWAY!",
                     "event_type": "second_half",
                     "home_score": home_score,
                     "away_score": away_score,
                 })
                 second_half_sent = True
             
-            # Full time
+            # Full Time
             if status == "completed" and not full_time_sent:
                 logger.info(f"🏁 FULL TIME: {home_score}-{away_score}")
                 send_live_update(match_id, "match_end", {
@@ -912,6 +934,18 @@ def poll_live_match(fixture: Dict):
                     if stats:
                         send_statistics(match_id, stats)
                 last_stats_time = time.time()
+            
+            # Periodic commentary heartbeat (every 30 seconds during live play)
+            if time.time() - last_commentary_time >= 30 and status_code in (2, 4):
+                send_commentary(match_id, {
+                    "minute": time_elapsed,
+                    "minute_display": minute_disp,
+                    "text": f"⏱️ Match is underway at {minute_disp}",
+                    "event_type": "heartbeat",
+                    "home_score": home_score,
+                    "away_score": away_score,
+                })
+                last_commentary_time = time.time()
             
             time.sleep(CONFIG.poll_interval_sec)
             
@@ -1087,6 +1121,9 @@ def main():
     
     logger.info(f"📋 Loaded {len(fixtures)} fixtures")
     
+    # Track which matches we've started lineup polling for
+    lineup_polling_started = set()
+    
     # Main loop
     while True:
         try:
@@ -1119,28 +1156,52 @@ def main():
             logger.info(f"   Kickoff: {closest['_kickoff_utc'].strftime('%Y-%m-%d %H:%M UTC')}")
             logger.info(f"   {minutes_until:.0f} minutes from now")
             
-            # Check for lineup polling window
-            if is_in_lineup_window(minutes_until):
-                if not closest.get("lineups_fetched") and not lineup_polling_active.get(closest["match_id"]):
-                    logger.info(f"🎯 Starting lineup polling for {closest['home_team']} vs {closest['away_team']}")
-                    threading.Thread(
-                        target=poll_lineups_continuous,
-                        args=(closest, closest["_kickoff_utc"]),
-                        daemon=True
-                    ).start()
-            
-            # Check if match should go live
-            if minutes_until <= 5:
-                logger.info(f"⚽ Match starting soon! Setting status to 'soon'")
-                update_game_status(closest["match_id"], "soon", is_live=False)
+            # ============================================================
+            # LINEUP POLLING WINDOW (60 to 50 minutes before kickoff)
+            # ============================================================
+            if 10 <= minutes_until <= 65:  # Start checking at 65 min, poll at 60 min
+                match_id = closest['match_id']
                 
+                # Start lineup polling at exactly 60 minutes before
+                if minutes_until <= 60 and match_id not in lineup_polling_started:
+                    if not closest.get("lineups_fetched"):
+                        logger.info(f"🎯 STARTING LINEUP POLLING for {closest['home_team']} vs {closest['away_team']}")
+                        logger.info(f"   {minutes_until:.0f} minutes until kickoff - polling every 30s")
+                        
+                        threading.Thread(
+                            target=poll_lineups_continuous,
+                            args=(closest, closest["_kickoff_utc"]),
+                            daemon=True
+                        ).start()
+                        
+                        lineup_polling_started.add(match_id)
+            
+            # ============================================================
+            # MATCH START WINDOW (5 minutes before and after kickoff)
+            # ============================================================
+            if minutes_until <= 5:
+                # Update status to "soon" at 5 minutes before
+                if minutes_until > 0 and closest.get("status") != "soon":
+                    logger.info(f"⚽ Match starting soon! Setting status to 'soon'")
+                    update_game_status(closest["match_id"], "soon", is_live=False)
+                
+                # Start live polling at kickoff (0 minutes)
                 if minutes_until <= 0:
-                    logger.info(f"⚽ MATCH LIVE! Starting poller")
+                    # Update status to live
+                    if closest.get("status") != "live":
+                        logger.info(f"⚽ MATCH LIVE! Starting poller")
+                        update_game_status(closest["match_id"], "live", is_live=True)
+                    
+                    # Start the live polling thread
                     start_polling(closest)
-                    time.sleep(CONFIG.poll_interval_sec)
+                    
+                    # Small sleep before checking again
+                    time.sleep(5)
                     continue
             
-            # Smart sleep
+            # ============================================================
+            # SMART SLEEP CALCULATION
+            # ============================================================
             sleep_seconds = calculate_sleep_duration(closest)
             logger.info(f"💤 Sleeping for {sleep_seconds:.0f} seconds")
             time.sleep(sleep_seconds)
