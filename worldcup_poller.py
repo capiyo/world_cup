@@ -1,60 +1,7 @@
 """
 World Cup 2026 — Flashscore.ninja Scraper + Live Poller
 =========================================================
-Verified working configuration (captured via live browser interception):
-
-  Host:    global.flashscore.ninja
-  Base:    /2/x/feed/
-  Token:   SW9D1eZo  (x-fsign header)
-  WC ID:   lvUBR5F8  (World Championship 2026)
-
-Hosts file required (run PowerShell as Admin):
-  Add-Content C:\\Windows\\System32\\drivers\\etc\\hosts "34.8.77.207 global.flashscore.ninja"
-  ipconfig /flushdns
-
-Feed row format (entire response is ONE line, rows separated by ~):
-  Rows are ¬-delimited KEY÷VALUE pairs.
-
-  Tournament header row (ZA÷ present):
-    ZC÷  season_id   (e.g. SbLsX4y7)
-    ZE÷  stage_id    (e.g. zeSHfCx3)
-
-  Fixture rows in to_{stage}_{season}_{page} (LME÷ present):
-    LME÷  match_id
-    LMJ÷  home team name
-    LMK÷  away team name
-    LMC÷  kickoff timestamp (unix)
-    LMS÷  status  (? = upcoming, "finished"/"FT" = completed, else live)
-    LMF÷  home score  (empty if not started)
-    AU÷   away score  (empty if not started)
-
-  Today's-only fixture rows in t_1_8_{WC_ID}_3_en_{page} (AA÷ present):
-    AA÷   match_id
-    CX÷   home team name
-    AE÷   away team name
-    AD÷   kickoff timestamp
-    AB÷   status code  1=upcoming 2=1H 3=HT 4=2H 7=FT 8=AET 9=AP
-    AG÷   home score
-    AH÷   away score
-
-  Live match detail dc_{id}:
-    Same AA÷ row format as above, plus:
-    BC÷/BD÷  time elapsed (minutes)
-
-  Incidents d_hb_{id}  — rows starting with INC÷:
-    INC÷<id>÷<type>÷<minute>÷<extra>÷<is_home>÷<player>÷[<assist_or_sub_out>]÷
-    type: G=goal YC=yellow RC=red SB=substitution MS=missed_pen PEN=penalty
-
-  Lineups li_{id}_1_en:
-    LU÷<home_formation>÷<away_formation>÷
-    PL÷<id>÷<name>÷<jersey>÷<pos>÷<is_home:1/0>÷<is_starter:1/0>÷[captain:1]÷
-    CO÷<id>÷<name>÷<is_home:1/0>÷
-
-  Statistics od_{id}:
-    ST÷<stat_key>÷<home_val>÷<away_val>÷
-
-Install:  pip install requests pymongo python-dotenv
-Run:      python worldcup_poller_flashscore.py
+Fixed version with proper live polling and lineup fetching
 """
 
 import time
@@ -71,8 +18,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests as std_requests
 from pymongo import MongoClient
 from dotenv import load_dotenv
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 load_dotenv()
@@ -85,8 +30,7 @@ WORLD_CUP_LABEL     = "World Cup 2026"
 WC_TOURNAMENT_ID    = "lvUBR5F8"          # Flashscore internal ID
 
 FS_NINJA_HOST       = "global.flashscore.ninja"
-#FS_FEED_BASE        = # Use IP directly — bypasses Render's DNS which can't resolve global.flashscore.ninja
-FS_FEED_BASE = "https://34.8.77.207/2/x/feed/"
+FS_FEED_BASE        = f"https://{FS_NINJA_HOST}/2/x/feed/"
 X_FSIGN_TOKEN       = "SW9D1eZo"
 
 MATCH_DURATION_MINS = 120
@@ -95,7 +39,7 @@ DB_NAME             = "clashdb"
 COLLECTION_NAME     = "fixtures"
 NAIROBI_OFFSET      = timedelta(hours=3)
 
-FANCLASH_API        = os.environ.get("FANCLASH_API")
+FANCLASH_API        = os.environ.get("FANCLASH_API", "http://localhost:5000/api")
 DEFAULT_ODDS        = {"home_win": 2.50, "away_win": 2.80, "draw": 3.20}
 
 POLL_INTERVAL_SEC        = 45
@@ -175,14 +119,11 @@ def _make_session() -> std_requests.Session:
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection":      "keep-alive",
-        "Host":            "global.flashscore.ninja",   # ← required for IP-direct requests
         "Referer":         "https://www.flashscore.com/",
         "Origin":          "https://www.flashscore.com",
         "User-Agent":      random.choice(USER_AGENTS),
         "X-Fsign":         X_FSIGN_TOKEN,
     })
-    # Disable SSL verification since cert is issued to hostname not IP
-    s.verify = False
     return s
 
 
@@ -875,7 +816,8 @@ def cleanup_all_completed_games(col, history_col):
             if mid and not game.get("moved_to_history"):
                 if move_completed_game_to_history(col, history_col, mid):
                     moved += 1
-        logger.info(f"🧹 Cleaned up {moved} completed World Cup games to history")
+        if moved > 0:
+            logger.info(f"🧹 Cleaned up {moved} completed World Cup games to history")
     except Exception as e:
         logger.error(f"Error cleaning up: {e}")
 
@@ -916,6 +858,7 @@ def mark_lineups_fetched(col, match_id: str):
         return
     try:
         col.update_one({"match_id": match_id}, {"$set": {"lineups_fetched": True}})
+        logger.info(f"   ✅ Marked lineups_fetched for {match_id}")
     except Exception as e:
         logger.warning(f"Could not mark lineups_fetched: {e}")
 
@@ -1004,8 +947,10 @@ def forward_event(fixture: dict, event_type: str, data: dict):
     }.items() if v is not None}
     try:
         r = std_requests.post(f"{FANCLASH_API}/games/live-update", json=payload, timeout=5)
-        if r.status_code != 200:
-            logger.warning(f"❌ forward_event {event_type}: {r.status_code}")
+        if r.status_code == 200:
+            logger.info(f"   ✅ Event forwarded: {event_type}")
+        else:
+            logger.warning(f"   ❌ forward_event {event_type}: {r.status_code}")
     except Exception as e:
         logger.error(f"forward_event error: {e}")
 
@@ -1048,30 +993,41 @@ def fetch_and_forward_lineups(fixture: Dict, col) -> bool:
         logger.warning(f"⚠️  No flashscore_id for {label}")
         return False
 
-    logger.info(f"📋 Fetching lineups for {label}")
-    raw     = fs_get(f"li_{fs_id}_1_en", base_delay=3.0)
-    lineups = parse_lineups_feed(raw)
-
-    if not lineups:
-        logger.info(f"   ⏳ Lineups not yet available for {label}")
-        return False
-
-    payload = {
-        "fixture_id": match_id,
-        "lineups":    lineups,
-        "timestamp":  datetime.now(timezone.utc).isoformat(),
-    }
-    try:
-        r = std_requests.post(f"{FANCLASH_API}/games/lineups", json=payload, timeout=5)
-        if r.status_code == 200:
-            logger.info(f"✅ Lineups stored for {label}")
-            mark_lineups_fetched(col, match_id)
-            return True
-        logger.warning(f"❌ Backend rejected lineups: {r.status_code}")
-        return False
-    except Exception as e:
-        logger.error(f"fetch_and_forward_lineups error: {e}")
-        return False
+    logger.info(f"📋 Fetching lineups for {label} (ID: {fs_id})")
+    
+    # Try multiple times with delay
+    for attempt in range(3):
+        raw = fs_get(f"li_{fs_id}_1_en", base_delay=3.0)
+        if not raw:
+            logger.warning(f"   Attempt {attempt+1}: No response for lineups")
+            time.sleep(5)
+            continue
+            
+        lineups = parse_lineups_feed(raw)
+        
+        if lineups and (lineups["home"]["players"] or lineups["away"]["players"]):
+            logger.info(f"   ✅ Lineups parsed successfully - Home: {len(lineups['home']['players'])} players, Away: {len(lineups['away']['players'])} players")
+            
+            payload = {
+                "fixture_id": match_id,
+                "lineups":    lineups,
+                "timestamp":  datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                r = std_requests.post(f"{FANCLASH_API}/games/lineups", json=payload, timeout=5)
+                if r.status_code == 200:
+                    logger.info(f"✅ Lineups stored for {label}")
+                    mark_lineups_fetched(col, match_id)
+                    return True
+                logger.warning(f"❌ Backend rejected lineups: {r.status_code}")
+            except Exception as e:
+                logger.error(f"fetch_and_forward_lineups error: {e}")
+        else:
+            logger.info(f"   Attempt {attempt+1}: Lineups not yet available for {label}")
+        
+        time.sleep(5)
+    
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1088,7 +1044,7 @@ def fetch_and_forward_statistics(fixture: dict, live_data: dict):
 
     raw = fs_get(f"od_{fs_id}", base_delay=2.0)
     if not raw:
-        logger.warning(f"   No statistics for {label}")
+        logger.debug(f"   No statistics for {label}")
         return
 
     payload = parse_statistics_feed(
@@ -1115,7 +1071,7 @@ def fetch_and_forward_statistics(fixture: dict, live_data: dict):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LIVE POLLER
+# LIVE POLLER - UPDATED VERSION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _find_goal(incidents: List[Dict], is_home: bool) -> Tuple[str, Optional[str]]:
@@ -1130,12 +1086,18 @@ def poll_live_game(fixture: dict, col, history_col):
     label    = f"{fixture['home_team']} vs {fixture['away_team']}"
     match_id = fixture["match_id"]
 
+    logger.info(f"🔴 POLL_LIVE_GAME STARTED for {label}")
+
     if not fs_id:
         logger.error(f"❌ No flashscore_id for {label}")
         return
 
     # Check if already finished before starting poll loop
-    initial = parse_live_feed(fs_get(f"dc_{fs_id}", base_delay=3.0))
+    logger.info(f"📡 Fetching initial live data for {label}")
+    live_response = fs_get(f"dc_{fs_id}", base_delay=3.0)
+    logger.info(f"   Initial response length: {len(live_response) if live_response else 0}")
+    
+    initial = parse_live_feed(live_response)
     if initial and initial["status"] == "completed":
         logger.info(f"⏭  {label} already completed")
         update_fixture_status(match_id, "completed")
@@ -1143,195 +1105,219 @@ def poll_live_game(fixture: dict, col, history_col):
         move_completed_game_to_history(col, history_col, match_id)
         return
 
+    # Try to get lineups one more time before starting
+    if not fixture.get("_lineups_fetched"):
+        logger.info(f"📋 Fetching lineups before starting poll for {label}")
+        fetch_and_forward_lineups(fixture, col)
+
     update_fixture_status(match_id, "live")
     update_db_status(col, match_id, "live")
-    logger.info(f"🔴 LIVE POLLING: {label}")
+    logger.info(f"🔴 LIVE POLLING ACTIVE: {label}")
 
-    last_home        = 0
-    last_away        = 0
+    last_home        = initial["home_score"] if initial else 0
+    last_away        = initial["away_score"] if initial else 0
     half_time_sent   = False
     full_time_sent   = False
     second_half_sent = False
     seen_incidents: set = set()
     poll_count       = 0
+    last_stats_time  = time.time()
 
     while True:
-        live = parse_live_feed(fs_get(f"dc_{fs_id}", base_delay=3.0))
-        if not live:
-            time.sleep(POLL_INTERVAL_SEC)
-            continue
-
-        incidents = parse_incidents_feed(fs_get(f"d_hb_{fs_id}", base_delay=2.0) or "")
-
-        home_score   = live["home_score"]
-        away_score   = live["away_score"]
-        status       = live["status"]
-        status_code  = live["status_code"]
-        time_elapsed = live["time_elapsed"]
-        time_extra   = live.get("time_extra", 0)
-        minute_disp  = f"{time_elapsed}" + (f"+{time_extra}" if time_extra else "")
-
-        # ── Goals ──────────────────────────────────────────────────────────
-        if home_score > last_home:
-            scorer, assist = _find_goal(incidents, is_home=True)
-            logger.info(f"⚽ GOAL {fixture['home_team']} — {scorer} ({minute_disp}')")
-            forward_event(fixture, "goal", {
-                "minute": time_elapsed, "minute_display": minute_disp,
-                "home_score": home_score, "away_score": away_score,
-                "team": fixture["home_team"], "player": scorer, "assist": assist,
-            })
-            send_commentary(fixture, {
-                "minute": time_elapsed, "minute_display": minute_disp,
-                "text": f"⚽ GOAL! {scorer} scores! ({home_score}-{away_score})",
-                "event_type": "goal", "home_score": home_score, "away_score": away_score,
-                "team": fixture["home_team"], "player": scorer,
-            })
-            last_home = home_score
-
-        if away_score > last_away:
-            scorer, assist = _find_goal(incidents, is_home=False)
-            logger.info(f"⚽ GOAL {fixture['away_team']} — {scorer} ({minute_disp}')")
-            forward_event(fixture, "goal", {
-                "minute": time_elapsed, "minute_display": minute_disp,
-                "home_score": home_score, "away_score": away_score,
-                "team": fixture["away_team"], "player": scorer, "assist": assist,
-            })
-            send_commentary(fixture, {
-                "minute": time_elapsed, "minute_display": minute_disp,
-                "text": f"⚽ GOAL! {scorer} scores! ({home_score}-{away_score})",
-                "event_type": "goal", "home_score": home_score, "away_score": away_score,
-                "team": fixture["away_team"], "player": scorer,
-            })
-            last_away = away_score
-
-        # ── Other incidents ────────────────────────────────────────────────
-        for inc in incidents:
-            inc_id = inc.get("id", "")
-            if inc_id in seen_incidents:
+        try:
+            # Fetch live data
+            live_response = fs_get(f"dc_{fs_id}", base_delay=3.0)
+            if not live_response:
+                logger.warning(f"   No live response for {label}, retrying...")
+                time.sleep(POLL_INTERVAL_SEC)
                 continue
-            seen_incidents.add(inc_id)
+                
+            live = parse_live_feed(live_response)
+            if not live:
+                logger.warning(f"   Failed to parse live feed for {label}")
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
 
-            inc_type = inc["type"]
-            is_home  = inc["is_home"]
-            team     = fixture["home_team"] if is_home else fixture["away_team"]
-            minute   = inc["minute"]
-            extra    = inc.get("extra", 0)
-            m_disp   = f"{minute}" + (f"+{extra}" if extra else "")
-            player   = inc.get("player", "Unknown")
-            text     = ""
-            ev_type  = inc_type.lower()
+            # Fetch incidents
+            incidents_response = fs_get(f"d_hb_{fs_id}", base_delay=2.0)
+            incidents = parse_incidents_feed(incidents_response or "")
 
-            if inc_type == "G":
-                continue  # handled above
+            home_score   = live["home_score"]
+            away_score   = live["away_score"]
+            status       = live["status"]
+            status_code  = live["status_code"]
+            time_elapsed = live["time_elapsed"]
+            time_extra   = live.get("time_extra", 0)
+            minute_disp  = f"{time_elapsed}" + (f"+{time_extra}" if time_extra else "")
 
-            elif inc_type == "YC":
-                text = f"🟨 YELLOW CARD - {player} ({team})"
-                logger.info(f"🟨 YELLOW — {team}: {player} ({m_disp}')")
-                forward_event(fixture, "yellow_card", {
-                    "minute": minute, "minute_display": m_disp, "player": player, "team": team,
+            logger.info(f"   📊 {label} @ {minute_disp}': {home_score}-{away_score}")
+
+            # ── Goals ──────────────────────────────────────────────────────────
+            if home_score > last_home:
+                scorer, assist = _find_goal(incidents, is_home=True)
+                logger.info(f"⚽ GOAL {fixture['home_team']} — {scorer} ({minute_disp}')")
+                forward_event(fixture, "goal", {
+                    "minute": time_elapsed, "minute_display": minute_disp,
+                    "home_score": home_score, "away_score": away_score,
+                    "team": fixture["home_team"], "player": scorer, "assist": assist,
                 })
-                ev_type = "yellow_card"
-
-            elif inc_type == "RC":
-                text = f"🟥 RED CARD - {player} ({team})"
-                logger.info(f"🟥 RED — {team}: {player} ({m_disp}')")
-                forward_event(fixture, "red_card", {
-                    "minute": minute, "minute_display": m_disp, "player": player, "team": team,
-                })
-                ev_type = "red_card"
-
-            elif inc_type == "SB":
-                p_out = inc.get("sub_out") or inc.get("assist") or "Unknown"
-                text  = f"🔄 SUB: {p_out} → {player} ({team})"
-                logger.info(f"🔄 SUB — {team}: {p_out} → {player} ({m_disp}')")
-                forward_event(fixture, "substitution", {
-                    "minute": minute, "minute_display": m_disp,
-                    "player_out": p_out, "player_in": player, "team": team,
-                })
-                ev_type = "substitution"
-
-            elif inc_type == "MS":
-                text = f"❌ MISSED PENALTY - {player} ({team})"
-                logger.info(f"❌ MISSED PEN — {team}: {player} ({m_disp}')")
-                forward_event(fixture, "missed_penalty", {
-                    "minute": minute, "minute_display": m_disp, "player": player, "team": team,
-                })
-                ev_type = "missed_penalty"
-
-            elif inc_type == "PEN":
-                text = f"🎯 PENALTY! {player} ({team})"
-                logger.info(f"🎯 PENALTY — {team}: {player} ({m_disp}')")
-                forward_event(fixture, "penalty", {
-                    "minute": minute, "minute_display": m_disp, "player": player, "team": team,
-                })
-                ev_type = "penalty"
-
-            if text:
                 send_commentary(fixture, {
-                    "minute": minute, "minute_display": m_disp, "text": text,
-                    "event_type": ev_type, "home_score": home_score, "away_score": away_score,
-                    "team": team,
-                    "player": player if inc_type != "SB" else None,
+                    "minute": time_elapsed, "minute_display": minute_disp,
+                    "text": f"⚽ GOAL! {scorer} scores! ({home_score}-{away_score})",
+                    "event_type": "goal", "home_score": home_score, "away_score": away_score,
+                    "team": fixture["home_team"], "player": scorer,
                 })
+                last_home = home_score
 
-        # ── Match phases ───────────────────────────────────────────────────
-        # status_code 3 = HT pause
-        if status_code == 3 and not half_time_sent:
-            logger.info(f"⏸  HALF TIME: {home_score}–{away_score}")
-            forward_event(fixture, "half_time", {
-                "minute": time_elapsed, "minute_display": f"{time_elapsed}'",
-                "home_score": home_score, "away_score": away_score,
-            })
-            send_commentary(fixture, {
-                "minute": time_elapsed, "minute_display": f"{time_elapsed}'",
-                "text": f"⏸ HALF TIME: {fixture['home_team']} {home_score}–{away_score} {fixture['away_team']}",
-                "event_type": "half_time", "home_score": home_score, "away_score": away_score,
-            })
-            update_db_status(col, match_id, "live", {"time_elapsed": time_elapsed, "half": 1})
-            fetch_and_forward_statistics(fixture, live)
-            half_time_sent = True
+            if away_score > last_away:
+                scorer, assist = _find_goal(incidents, is_home=False)
+                logger.info(f"⚽ GOAL {fixture['away_team']} — {scorer} ({minute_disp}')")
+                forward_event(fixture, "goal", {
+                    "minute": time_elapsed, "minute_display": minute_disp,
+                    "home_score": home_score, "away_score": away_score,
+                    "team": fixture["away_team"], "player": scorer, "assist": assist,
+                })
+                send_commentary(fixture, {
+                    "minute": time_elapsed, "minute_display": minute_disp,
+                    "text": f"⚽ GOAL! {scorer} scores! ({home_score}-{away_score})",
+                    "event_type": "goal", "home_score": home_score, "away_score": away_score,
+                    "team": fixture["away_team"], "player": scorer,
+                })
+                last_away = away_score
 
-        # status_code 4 = second half in progress
-        if status_code == 4 and half_time_sent and not second_half_sent:
-            logger.info("▶️  SECOND HALF STARTED")
-            forward_event(fixture, "second_half", {
-                "minute": time_elapsed, "minute_display": f"{time_elapsed}'",
-            })
-            send_commentary(fixture, {
-                "minute": time_elapsed, "minute_display": f"{time_elapsed}'",
-                "text": f"▶️ SECOND HALF UNDERWAY! {fixture['home_team']} {home_score}–{away_score} {fixture['away_team']}",
-                "event_type": "second_half", "home_score": home_score, "away_score": away_score,
-            })
-            update_db_status(col, match_id, "live", {"half": 2})
-            second_half_sent = True
+            # ── Other incidents ────────────────────────────────────────────────
+            for inc in incidents:
+                inc_id = inc.get("id", "")
+                if inc_id in seen_incidents:
+                    continue
+                seen_incidents.add(inc_id)
 
-        if status == "completed" and not full_time_sent:
-            logger.info(f"🏁 FULL TIME: {label} — {home_score}–{away_score}")
-            forward_event(fixture, "match_end", {
-                "minute": time_elapsed, "minute_display": f"{time_elapsed}'",
-                "home_score": home_score, "away_score": away_score,
-            })
-            send_commentary(fixture, {
-                "minute": time_elapsed, "minute_display": f"{time_elapsed}'",
-                "text": f"🏁 FULL TIME: {fixture['home_team']} {home_score}–{away_score} {fixture['away_team']}",
-                "event_type": "full_time", "home_score": home_score, "away_score": away_score,
-            })
-            update_fixture_status(match_id, "completed")
-            update_db_status(col, match_id, "completed", {
-                "home_score": home_score, "away_score": away_score, "time_elapsed": time_elapsed,
-            })
-            fetch_and_forward_statistics(fixture, live)
-            move_completed_game_to_history(col, history_col, match_id)
-            full_time_sent = True
-            break
+                inc_type = inc["type"]
+                is_home  = inc["is_home"]
+                team     = fixture["home_team"] if is_home else fixture["away_team"]
+                minute   = inc["minute"]
+                extra    = inc.get("extra", 0)
+                m_disp   = f"{minute}" + (f"+{extra}" if extra else "")
+                player   = inc.get("player", "Unknown")
+                text     = ""
+                ev_type  = inc_type.lower()
 
-        # Periodic stats every 5 polls (~225 s)
-        poll_count += 1
-        if poll_count % 5 == 0:
-            logger.info(f"📊 Stats snapshot at {minute_disp}' for {label}")
-            fetch_and_forward_statistics(fixture, live)
+                if inc_type == "G":
+                    continue  # handled above
 
-        time.sleep(POLL_INTERVAL_SEC)
+                elif inc_type == "YC":
+                    text = f"🟨 YELLOW CARD - {player} ({team})"
+                    logger.info(f"🟨 YELLOW — {team}: {player} ({m_disp}')")
+                    forward_event(fixture, "yellow_card", {
+                        "minute": minute, "minute_display": m_disp, "player": player, "team": team,
+                    })
+                    ev_type = "yellow_card"
+
+                elif inc_type == "RC":
+                    text = f"🟥 RED CARD - {player} ({team})"
+                    logger.info(f"🟥 RED — {team}: {player} ({m_disp}')")
+                    forward_event(fixture, "red_card", {
+                        "minute": minute, "minute_display": m_disp, "player": player, "team": team,
+                    })
+                    ev_type = "red_card"
+
+                elif inc_type == "SB":
+                    p_out = inc.get("sub_out") or inc.get("assist") or "Unknown"
+                    text  = f"🔄 SUB: {p_out} → {player} ({team})"
+                    logger.info(f"🔄 SUB — {team}: {p_out} → {player} ({m_disp}')")
+                    forward_event(fixture, "substitution", {
+                        "minute": minute, "minute_display": m_disp,
+                        "player_out": p_out, "player_in": player, "team": team,
+                    })
+                    ev_type = "substitution"
+
+                elif inc_type == "MS":
+                    text = f"❌ MISSED PENALTY - {player} ({team})"
+                    logger.info(f"❌ MISSED PEN — {team}: {player} ({m_disp}')")
+                    forward_event(fixture, "missed_penalty", {
+                        "minute": minute, "minute_display": m_disp, "player": player, "team": team,
+                    })
+                    ev_type = "missed_penalty"
+
+                elif inc_type == "PEN":
+                    text = f"🎯 PENALTY! {player} ({team})"
+                    logger.info(f"🎯 PENALTY — {team}: {player} ({m_disp}')")
+                    forward_event(fixture, "penalty", {
+                        "minute": minute, "minute_display": m_disp, "player": player, "team": team,
+                    })
+                    ev_type = "penalty"
+
+                if text:
+                    send_commentary(fixture, {
+                        "minute": minute, "minute_display": m_disp, "text": text,
+                        "event_type": ev_type, "home_score": home_score, "away_score": away_score,
+                        "team": team,
+                        "player": player if inc_type != "SB" else None,
+                    })
+
+            # ── Match phases ───────────────────────────────────────────────────
+            # status_code 3 = HT pause
+            if status_code == 3 and not half_time_sent:
+                logger.info(f"⏸  HALF TIME: {home_score}–{away_score}")
+                forward_event(fixture, "half_time", {
+                    "minute": time_elapsed, "minute_display": f"{time_elapsed}'",
+                    "home_score": home_score, "away_score": away_score,
+                })
+                send_commentary(fixture, {
+                    "minute": time_elapsed, "minute_display": f"{time_elapsed}'",
+                    "text": f"⏸ HALF TIME: {fixture['home_team']} {home_score}–{away_score} {fixture['away_team']}",
+                    "event_type": "half_time", "home_score": home_score, "away_score": away_score,
+                })
+                update_db_status(col, match_id, "live", {"time_elapsed": time_elapsed, "half": 1})
+                fetch_and_forward_statistics(fixture, live)
+                half_time_sent = True
+
+            # status_code 4 = second half in progress
+            if status_code == 4 and half_time_sent and not second_half_sent:
+                logger.info("▶️  SECOND HALF STARTED")
+                forward_event(fixture, "second_half", {
+                    "minute": time_elapsed, "minute_display": f"{time_elapsed}'",
+                })
+                send_commentary(fixture, {
+                    "minute": time_elapsed, "minute_display": f"{time_elapsed}'",
+                    "text": f"▶️ SECOND HALF UNDERWAY! {fixture['home_team']} {home_score}–{away_score} {fixture['away_team']}",
+                    "event_type": "second_half", "home_score": home_score, "away_score": away_score,
+                })
+                update_db_status(col, match_id, "live", {"half": 2})
+                second_half_sent = True
+
+            if status == "completed" and not full_time_sent:
+                logger.info(f"🏁 FULL TIME: {label} — {home_score}–{away_score}")
+                forward_event(fixture, "match_end", {
+                    "minute": time_elapsed, "minute_display": f"{time_elapsed}'",
+                    "home_score": home_score, "away_score": away_score,
+                })
+                send_commentary(fixture, {
+                    "minute": time_elapsed, "minute_display": f"{time_elapsed}'",
+                    "text": f"🏁 FULL TIME: {fixture['home_team']} {home_score}–{away_score} {fixture['away_team']}",
+                    "event_type": "full_time", "home_score": home_score, "away_score": away_score,
+                })
+                update_fixture_status(match_id, "completed")
+                update_db_status(col, match_id, "completed", {
+                    "home_score": home_score, "away_score": away_score, "time_elapsed": time_elapsed,
+                })
+                fetch_and_forward_statistics(fixture, live)
+                move_completed_game_to_history(col, history_col, match_id)
+                full_time_sent = True
+                break
+
+            # Periodic stats every 5 minutes
+            if time.time() - last_stats_time >= 300:  # 5 minutes
+                logger.info(f"📊 Stats snapshot at {minute_disp}' for {label}")
+                fetch_and_forward_statistics(fixture, live)
+                last_stats_time = time.time()
+
+            poll_count += 1
+            time.sleep(POLL_INTERVAL_SEC)
+
+        except Exception as e:
+            logger.error(f"Error in poll loop for {label}: {e}", exc_info=True)
+            time.sleep(POLL_INTERVAL_SEC)
 
     logger.info(f"✅ Done polling {label}")
 
@@ -1346,7 +1332,7 @@ _queue_lock:          threading.Lock = threading.Lock()
 
 
 def _queue_worker():
-    logger.info("🔁 Poll queue worker started")
+    logger.info("🔁 Poll queue worker started - THREAD ALIVE")
     while True:
         try:
             task = _poll_queue.get(timeout=5)
@@ -1356,8 +1342,11 @@ def _queue_worker():
             match_id = fixture["match_id"]
             label    = f"{fixture['home_team']} vs {fixture['away_team']}"
 
+            logger.info(f"🔄 WORKER PROCESSING: {label}")
+
             with polls_lock:
                 if match_id in active_polls:
+                    logger.info(f"⚠️ Already polling {label}, skipping")
                     _poll_queue.task_done()
                     continue
                 active_polls.add(match_id)
@@ -1365,7 +1354,7 @@ def _queue_worker():
             try:
                 poll_live_game(fixture, col, history_col)
             except Exception as e:
-                logger.error(f"Poll error for {label}: {e}")
+                logger.error(f"Poll error for {label}: {e}", exc_info=True)
             finally:
                 with polls_lock:
                     active_polls.discard(match_id)
@@ -1374,7 +1363,7 @@ def _queue_worker():
         except _queue.Empty:
             continue
         except Exception as e:
-            logger.error(f"Queue worker error: {e}")
+            logger.error(f"Queue worker error: {e}", exc_info=True)
 
 
 def _ensure_queue_worker():
@@ -1385,28 +1374,42 @@ def _ensure_queue_worker():
                 target=_queue_worker, daemon=True, name="wc-poll-worker"
             ).start()
             _queue_worker_started = True
+            logger.info("✅ Queue worker thread started")
 
 
 def start_polling_for_game(fixture: dict, col, history_col):
     match_id = fixture["match_id"]
+    label = f"{fixture['home_team']} vs {fixture['away_team']}"
+    
     with polls_lock:
         if match_id in active_polls:
+            logger.info(f"⏭️  Already polling {label}")
             return
+    
     _ensure_queue_worker()
     _poll_queue.put((fixture, col, history_col))
-    logger.info(f"📥 Queued: {fixture['home_team']} vs {fixture['away_team']}")
+    logger.info(f"📥 Queued: {label}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN LOOP
+# MAIN LOOP - UPDATED VERSION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
     logger.info("=" * 65)
-    logger.info("🏆 FanClash — World Cup 2026 Flashscore Poller")
+    logger.info("🏆 FanClash — World Cup 2026 Flashscore Poller (UPDATED)")
     logger.info("=" * 65)
 
     start_health_server()
+    
+    # Test backend connectivity
+    if FANCLASH_API:
+        try:
+            test_resp = std_requests.get(f"{FANCLASH_API}/health", timeout=5)
+            logger.info(f"✅ Backend API reachable: {test_resp.status_code}")
+        except Exception as e:
+            logger.error(f"❌ Backend API unreachable at {FANCLASH_API}: {e}")
+    
     mongo_client, col = connect_db()
     history_col       = get_history_collection(mongo_client)
 
@@ -1453,15 +1456,23 @@ def main():
                 logger.info(f"\n🔴 {len(live_fixtures)} LIVE GAME(S)")
                 for lf in live_fixtures:
                     mid = lf["match_id"]
+                    
+                    # Force status update
                     if lf.get("status") != "live":
                         update_fixture_status(mid, "live")
                         update_db_status(col, mid, "live")
 
+                    # Try to fetch lineups if not already fetched
                     if mid not in lineups_fetched_set and not lf.get("_lineups_fetched"):
+                        logger.info(f"📋 Fetching lineups for {lf['home_team']} vs {lf['away_team']}")
                         if not check_lineups_exist_in_backend(mid):
-                            fetch_and_forward_lineups(lf, col)
-                        lineups_fetched_set.add(mid)
-
+                            if fetch_and_forward_lineups(lf, col):
+                                lineups_fetched_set.add(mid)
+                        else:
+                            lineups_fetched_set.add(mid)
+                            logger.info(f"   Lineups already in backend")
+                    
+                    # Start polling
                     start_polling_for_game(lf, col, history_col)
 
                 time.sleep(LIVE_CHECK_INTERVAL_SEC)
@@ -1492,32 +1503,33 @@ def main():
                 icon     = "🔴" if f.get("status") == "soon" else "⏳"
                 logger.info(f"   {icon} {f['home_team']} vs {f['away_team']} at {ko_local} EAT ({int(mins)} mins)")
 
-            for mins_to_game, fixture in upcoming:
-                mid   = fixture["match_id"]
-                label = f"{fixture['home_team']} vs {fixture['away_team']}"
+            for mins_to_game, fixture_item in upcoming:
+                mid   = fixture_item["match_id"]
+                label = f"{fixture_item['home_team']} vs {fixture_item['away_team']}"
 
                 if 0 < mins_to_game <= 60:
-                    if fixture.get("status") != "soon":
+                    if fixture_item.get("status") != "soon":
                         logger.info(f"⏰ {label} — {int(mins_to_game)} mins — setting SOON")
                         update_fixture_status(mid, "soon")
                         update_db_status(col, mid, "soon")
 
-                    if mid not in lineups_fetched_set and not fixture.get("_lineups_fetched"):
+                    if mid not in lineups_fetched_set and not fixture_item.get("_lineups_fetched"):
                         if not check_lineups_exist_in_backend(mid):
-                            if fetch_and_forward_lineups(fixture, col):
+                            logger.info(f"📋 Pre-fetching lineups for {label}")
+                            if fetch_and_forward_lineups(fixture_item, col):
                                 lineups_fetched_set.add(mid)
                         else:
                             lineups_fetched_set.add(mid)
                             logger.info(f"   Lineups already in backend for {label}")
 
                 elif mins_to_game <= 1440:
-                    if fixture.get("status") not in ("upcoming", "soon"):
+                    if fixture_item.get("status") not in ("upcoming", "soon"):
                         update_db_status(col, mid, "upcoming")
 
             # ── Start polling if kickoff ≤ 5 min away ─────────────────────
             closest_mins, closest_fixture = upcoming[0]
             if 0 < closest_mins <= 5:
-                logger.info(f"⚽ {closest_fixture['home_team']} vs {closest_fixture['away_team']} in {int(closest_mins)} mins")
+                logger.info(f"⚽ {closest_fixture['home_team']} vs {closest_fixture['away_team']} in {int(closest_mins)} mins - STARTING POLL")
                 start_polling_for_game(closest_fixture, col, history_col)
                 time.sleep(POLL_INTERVAL_SEC)
                 continue

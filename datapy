@@ -1,22 +1,8 @@
-import requests
-from datetime import datetime, timedelta
 
-today = datetime.utcnow()
-date_to = today + timedelta(days=7)
-
-response = requests.get(
-    "https://api-football-v1.p.rapidapi.com/v3/fixtures",
-    headers={
-        "X-RapidAPI-Key": "your_rapidapi_key",
-        "X-RapidAPI-Host": "api-football-v1.p.rapidapi.com"
-    },
-    params={
-        "league": "1",
-        "season": "2026",
-        "from": today.strftime("%Y-%m-%d"),
-        "to": date_to.strftime("%Y-%m-%d"),
-    }
-)
-
-print(response.status_code)
-print(response.json())  # see exact error
+import requests, random
+s = requests.Session()
+s.headers.update({'X-Fsign':'SW9D1eZo','Referer':'https://www.flashscore.com/','User-Agent':'Mozilla/5.0'})
+raw = s.get('https://global.flashscore.ninja/2/x/feed/to_zeSHfCx3_SbLsX4y7_1',timeout=20).text
+for row in raw.split('~'):
+    if 'Canada' in row or 'Bosnia' in row:
+        print(row[:300])
