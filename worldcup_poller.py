@@ -356,9 +356,13 @@ def parse_incidents_feed(raw: str) -> List[Dict]:
     return incidents
 
 def parse_lineups_feed(raw: str) -> Optional[Dict]:
-    """Parse lineups data"""
+    """Parse lineups data with debug logging"""
     if not raw:
+        logger.warning("No raw lineup data received")
         return None
+    
+    # Log first 500 chars to see what we're getting
+    logger.info(f"📝 Raw lineup response (first 500 chars): {raw[:500]}")
     
     lineups = {
         "home": {"formation": "4-4-2", "players": [], "bench": [], "coach": {"name": "Unknown"}},
@@ -366,50 +370,84 @@ def parse_lineups_feed(raw: str) -> Optional[Dict]:
     }
     found_any = False
     
+    # Count how many players found
+    home_players_count = 0
+    away_players_count = 0
+    
     for row in raw.split("~"):
         row = row.strip()
         if not row:
             continue
+            
+        logger.debug(f"Processing row: {row[:200]}")
+        
         for segment in row.split("¬"):
             segment = segment.strip()
             if not segment:
                 continue
             
+            # Look for formation
             if segment.startswith("LU÷"):
                 parts = segment[3:].split("÷")
+                logger.info(f"🔢 Formation found: {parts}")
                 if len(parts) >= 1 and parts[0]:
                     lineups["home"]["formation"] = parts[0]
                 if len(parts) >= 2 and parts[1]:
                     lineups["away"]["formation"] = parts[1]
             
+            # Look for players
             elif segment.startswith("PL÷"):
                 parts = segment[3:].split("÷")
                 if len(parts) < 6:
+                    logger.debug(f"PL segment too short: {len(parts)} parts")
                     continue
                 try:
                     jersey = int(parts[2]) if parts[2].isdigit() else 0
                     side = "home" if parts[4] == "1" else "away"
                     is_starter = parts[5] == "1"
+                    player_name = _clean(parts[1])
+                    
                     player = {
-                        "name": _clean(parts[1]),
+                        "name": player_name,
                         "position": parts[3] or "Unknown",
                         "jerseyNumber": jersey,
                         "captain": len(parts) > 7 and parts[7] == "1",
                         "lineup": is_starter,
                         "playerId": None,
                     }
-                    lineups[side]["players" if is_starter else "bench"].append(player)
+                    
+                    if is_starter:
+                        lineups[side]["players"].append(player)
+                        if side == "home":
+                            home_players_count += 1
+                        else:
+                            away_players_count += 1
+                    else:
+                        lineups[side]["bench"].append(player)
+                    
                     found_any = True
-                except (ValueError, IndexError):
+                    logger.info(f"✅ Found player: {player_name} ({side}, starter={is_starter})")
+                    
+                except (ValueError, IndexError) as e:
+                    logger.warning(f"Error parsing PL segment: {e}")
                     continue
             
+            # Look for coaches
             elif segment.startswith("CO÷"):
                 parts = segment[3:].split("÷")
                 if len(parts) >= 3:
                     side = "home" if parts[2] == "1" else "away"
                     lineups[side]["coach"]["name"] = _clean(parts[1]) or "Unknown"
+                    logger.info(f"👨‍🏫 Coach found for {side}: {lineups[side]['coach']['name']}")
     
-    return lineups if found_any else None
+    logger.info(f"📊 Parsing complete - Home players: {home_players_count}, Away players: {away_players_count}")
+    
+    if found_any and (home_players_count > 0 or away_players_count > 0):
+        logger.info(f"✅ Successfully parsed lineups!")
+        return lineups
+    
+    logger.warning(f"❌ No players parsed from lineup feed")
+    return None
 
 def parse_statistics_feed(raw: str, time_elapsed: int, time_extra: int, home_score: int, away_score: int) -> Optional[Dict]:
     """Parse statistics data"""
@@ -596,7 +634,7 @@ def get_lineup_poll_deadline(kickoff_utc: datetime) -> float:
     return deadline.timestamp()
 
 def poll_lineups_continuous(fixture: Dict, kickoff_utc: datetime):
-    """Poll for lineups continuously until found (or until match starts)"""
+    """Poll for lineups continuously until found"""
     match_id = fixture["match_id"]
     fs_id = fixture.get("flashscore_id") or match_id
     label = f"{fixture['home_team']} vs {fixture['away_team']}"
@@ -604,21 +642,35 @@ def poll_lineups_continuous(fixture: Dict, kickoff_utc: datetime):
     poll_count = 0
     start_time = datetime.now(timezone.utc)
     
-    logger.info(f"🔍 Starting lineup polling for {label} - will poll every 30s until lineups are found")
+    logger.info(f"🔍 Starting continuous lineup polling for {label}")
+    logger.info(f"   Flashscore ID: {fs_id}")
+    logger.info(f"   Will poll every {CONFIG.lineup_poll_interval_sec} seconds")
     
     with lineup_polling_lock:
         lineup_polling_active[match_id] = True
     
     try:
-        # Keep polling until we find lineups OR until match starts (10 minutes after kickoff)
         while True:
             poll_count += 1
             elapsed = (datetime.now(timezone.utc) - start_time).total_seconds() / 60
-            logger.info(f"📋 Lineup poll #{poll_count} for {label} (polling for {elapsed:.1f} minutes)")
             
-            # Fetch lineups
-            raw = fs_get(f"li_{fs_id}_1_en", base_delay=1.0)
+            # Build the URL for debugging
+            query = f"li_{fs_id}_1_en"
+            url = f"{CONFIG.fs_feed_url}{query}"
+            logger.info(f"📋 Lineup poll #{poll_count} - fetching: {url}")
+            
+            raw = fs_get(query, base_delay=1.0)
+            
             if raw:
+                logger.info(f"📥 Got response, length: {len(raw)} chars")
+                
+                # Check if response contains lineup indicators
+                if "PL÷" in raw:
+                    logger.info(f"🎯 Found 'PL÷' in response - lineups should be present!")
+                
+                if "LU÷" in raw:
+                    logger.info(f"🎯 Found 'LU÷' in response - formations should be present!")
+                
                 lineups = parse_lineups_feed(raw)
                 if lineups and (lineups["home"]["players"] or lineups["away"]["players"]):
                     logger.info(f"✅✅✅ LINEUPS FOUND for {label}! ✅✅✅")
@@ -626,25 +678,17 @@ def poll_lineups_continuous(fixture: Dict, kickoff_utc: datetime):
                     logger.info(f"   Away: {len(lineups['away']['players'])} players")
                     
                     if send_lineups(match_id, lineups):
-                        # Update MongoDB
                         if fixture.get("_col"):
                             fixture["_col"].update_one(
                                 {"match_id": match_id},
                                 {"$set": {"lineups_fetched": True}}
                             )
-                        logger.info(f"🎉 Lineups successfully sent to backend for {label}")
                         return
+            else:
+                logger.warning(f"⚠️ No response for lineup poll #{poll_count}")
             
-            # Check if match has started (10 minutes after kickoff)
-            if datetime.now(timezone.utc) > kickoff_utc + timedelta(minutes=10):
-                logger.warning(f"⚠️ Match started 10 minutes ago, stopping lineup polling for {label}")
-                break
-            
-            # Wait before next poll
             time.sleep(CONFIG.lineup_poll_interval_sec)
-        
-        logger.warning(f"❌ No lineups found for {label} before match start")
-    
+            
     finally:
         with lineup_polling_lock:
             lineup_polling_active.pop(match_id, None)
