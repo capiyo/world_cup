@@ -1,11 +1,17 @@
 """
-World Cup 2026 — Flashscore.ninja Scraper + Live Poller
-=========================================================
-Complete rewrite with:
-- Smart sleep: deep sleep until 3 hours before match, then hourly, then continuous
-- Continuous lineup polling from 58-53 minutes before kickoff
+World Cup 2026 — Football-Data.org Poller
+============================================
+Using Football-Data.org API endpoints:
+- Matches: GET /v4/competitions/WC/matches
+- Live: Filter by status = LIVE
+- Lineups: GET /v4/matches/{id}/lineups
+- Statistics: Not available in free tier (use alternative)
+- Events: Not available in free tier (use alternative)
+
+Maintains full structure with:
+- Smart sleep until 3 hours before match
+- Continuous lineup polling from 90 minutes before kickoff
 - Live commentary via WebSocket broadcasting
-- Statistics fetching every 5 minutes
 - FCM notifications integration
 - Full compatibility with Rust backend
 """
@@ -14,7 +20,6 @@ import time
 import random
 import logging
 import os
-import re
 import threading
 import queue as _queue
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -43,14 +48,11 @@ class MatchStatus(Enum):
 class Config:
     world_cup_label: str = "World Cup 2026"
     tournament_id: str = "lvUBR5F8"
-    fs_ninja_host: str = "global.flashscore.ninja"
-    fs_feed_base: str = f"https://global.flashscore.ninja/2/x/feed/"
-    x_fsign_token: str = "SW9D1eZo"
     
-    # football-data.org
-    fd_api_key: str = os.getenv("FD_API_KEY", "")
+    # Football-Data.org
+    fd_api_key: str = os.getenv("FD_API_KEY", "d6016bacb4a44b41a554cf1aa7973d72")
     fd_base: str = "https://api.football-data.org/v4"
-    fd_wc_code: str = "WC"
+    fd_wc_code: str = "WC"  # World Cup competition code
     
     # Database
     database_url: str = os.getenv("MONGO_URI", "mongodb://localhost:27017")
@@ -68,9 +70,9 @@ class Config:
     live_check_interval_sec: int = 30
     cleanup_interval_sec: int = 300
     
-    # Lineup polling window (58 to 53 minutes before kickoff)
-    lineup_poll_start_min: int = 58
-    lineup_poll_end_min: int = 53
+    # Lineup polling window (start 90 minutes before kickoff)
+    lineup_poll_start_min: int = 90
+    lineup_poll_end_min: int = 0
     
     # Match duration for completion detection
     match_duration_mins: int = 120
@@ -84,10 +86,6 @@ class Config:
     def __post_init__(self):
         if self.default_odds is None:
             self.default_odds = {"home_win": 2.50, "away_win": 2.80, "draw": 3.20}
-    
-    @property
-    def fs_feed_url(self) -> str:
-        return self.fs_feed_base
 
 CONFIG = Config()
 
@@ -108,7 +106,7 @@ logger = logging.getLogger(__name__)
 
 active_polls: set = set()
 polls_lock = threading.Lock()
-fs_semaphore = threading.Semaphore(1)
+api_semaphore = threading.Semaphore(1)
 lineup_polling_active: Dict[str, bool] = {}
 lineup_polling_lock = threading.Lock()
 
@@ -143,14 +141,8 @@ def start_health_server():
     logger.info(f"🌐 Health server on port {port}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTTP CLIENT WITH ROTATING USER AGENTS
+# FOOTBALL-DATA.ORG HTTP CLIENT
 # ─────────────────────────────────────────────────────────────────────────────
-
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
-]
 
 _session: Optional[std_requests.Session] = None
 _session_lock = threading.Lock()
@@ -158,14 +150,8 @@ _session_lock = threading.Lock()
 def _make_session() -> std_requests.Session:
     s = std_requests.Session()
     s.headers.update({
-        "Accept": "text/plain, */*; q=0.01",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Referer": "https://www.flashscore.com/",
-        "Origin": "https://www.flashscore.com",
-        "User-Agent": random.choice(USER_AGENTS),
-        "X-Fsign": CONFIG.x_fsign_token,
+        "X-Auth-Token": CONFIG.fd_api_key,
+        "Accept": "application/json",
     })
     return s
 
@@ -182,323 +168,190 @@ def _reset_session():
         _session = _make_session()
     logger.info("🔄 Session reset")
 
-def fs_get(query: str, retries: int = 5, base_delay: float = 2.0) -> Optional[str]:
-    """Fetch from Flashscore with retry logic"""
-    url = f"{CONFIG.fs_feed_url}{query}"
-    session_reset_done = False
+def fd_get(endpoint: str, params: Dict = None, retries: int = 3, base_delay: float = 1.0) -> Optional[Dict]:
+    """
+    Fetch from Football-Data.org with retry logic.
+    """
+    url = f"{CONFIG.fd_base}{endpoint}"
     
     for attempt in range(retries):
         try:
-            with fs_semaphore:
+            with api_semaphore:
+                # Rate limiting - 10 requests per minute free tier
                 time.sleep(random.uniform(base_delay, base_delay + 2.0))
-                resp = _get_session().get(url, timeout=20)
+                resp = _get_session().get(url, params=params, timeout=20)
             
             if resp.status_code == 200:
-                return resp.text
-            
-            if resp.status_code == 404:
-                logger.debug(f"FS 404: {query}")
-                return None
-            
-            if resp.status_code == 403:
-                wait = (2 ** attempt) * random.uniform(4, 8)
-                logger.warning(f"FS 403 attempt {attempt+1} — backoff {wait:.0f}s")
-                time.sleep(wait)
-                if not session_reset_done:
-                    _reset_session()
-                    session_reset_done = True
-                continue
+                return resp.json()
             
             if resp.status_code == 429:
                 wait = 30 * (attempt + 1)
-                logger.warning(f"FS 429 — waiting {wait}s")
+                logger.warning(f"Rate limited — waiting {wait}s")
                 time.sleep(wait)
                 continue
             
-            logger.warning(f"FS HTTP {resp.status_code} attempt {attempt+1}")
+            if resp.status_code == 403:
+                logger.warning(f"API 403 attempt {attempt+1} — check API key")
+                time.sleep(5)
+                continue
+            
+            logger.warning(f"API HTTP {resp.status_code} attempt {attempt+1}: {resp.text[:200]}")
             time.sleep(5)
             
         except Exception as e:
-            logger.warning(f"FS error attempt {attempt+1}: {e}")
+            logger.warning(f"API error attempt {attempt+1}: {e}")
             time.sleep(8)
     
-    logger.error(f"FS all retries exhausted: {query}")
+    logger.error(f"API all retries exhausted: {endpoint}")
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PARSERS
+# FOOTBALL-DATA.ORG DATA PARSERS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _parse_rows(raw: str) -> List[Dict[str, str]]:
-    """Parse Flashscore pipe-delimited format"""
-    rows = []
-    for row in raw.split("~"):
-        row = row.strip()
-        if not row:
-            continue
-        f: Dict[str, str] = {}
-        for part in row.split("¬"):
-            if "÷" in part:
-                k, _, v = part.partition("÷")
-                f[k.strip()] = v.strip()
-        if f:
-            rows.append(f)
-    return rows
+def _map_fd_status(status: str) -> Tuple[str, int]:
+    """
+    Map Football-Data.org status to internal status and code.
+    Statuses: SCHEDULED, LIVE, IN_PLAY, PAUSED, FINISHED, POSTPONED, CANCELLED
+    """
+    status_map = {
+        "SCHEDULED": ("upcoming", 1),
+        "TIMED": ("upcoming", 1),
+        "LIVE": ("live", 2),
+        "IN_PLAY": ("live", 2),
+        "PAUSED": ("live", 3),
+        "FINISHED": ("completed", 7),
+        "POSTPONED": ("upcoming", 11),
+        "CANCELLED": ("upcoming", 12),
+        "SUSPENDED": ("completed", 10),
+        "AWARDED": ("completed", 14),
+    }
+    return status_map.get(status, ("upcoming", 1))
 
-_STRIP_TAGS = re.compile(r"<[^>]+>")
-
-def _clean(s: str) -> str:
-    return " ".join(_STRIP_TAGS.sub("", s).split())
-
-def _map_status_code(code: int) -> str:
-    if code in (100, 110, 111, 120, 121):
-        return "completed"
-    if code in (2, 3, 4, 5, 6, 7, 8, 9, 10, 41, 42):
-        return "live"
-    return "upcoming"
-
-def _ts_to_eat(ts: int) -> Tuple[str, str, str]:
-    """Convert timestamp to EAT (UTC+3)"""
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc) + CONFIG.nairobi_offset
-    return dt.strftime("%Y-%m-%d"), dt.strftime("%d %b"), dt.strftime("%H:%M")
-
-def _safe_int(v: str) -> Optional[int]:
-    v = v.strip()
-    if v and v not in ("-", ""):
-        try:
-            return int(v)
-        except ValueError:
-            pass
-    return None
-
-def parse_live_feed(raw: str) -> Optional[Dict]:
-    """Parse dc_{match_id} - live scores, status, time elapsed"""
-    if not raw:
-        return None
+def parse_fixtures_response(data: Dict) -> List[Dict]:
+    """Parse Football-Data.org matches response"""
+    fixtures = []
     
-    for f in _parse_rows(raw):
-        match_id = f.get("AA", "").strip()
+    if not data or "matches" not in data:
+        return fixtures
+    
+    for match in data["matches"]:
+        match_id = str(match.get("id", ""))
         if not match_id:
             continue
         
+        # Parse date
+        date_str = match.get("utcDate", "")
+        kickoff_utc = None
         try:
-            status_code = int(f.get("AB", "1"))
-        except (ValueError, TypeError):
-            status_code = 1
-        
-        status = _map_status_code(status_code)
-        home_score = _safe_int(f.get("AG", "")) or 0
-        away_score = _safe_int(f.get("AH", "")) or 0
-        
-        time_elapsed = 0
-        for tf in ("BC", "BD", "BF", "BG"):
-            v = f.get(tf, "").strip()
-            if v and v.isdigit():
-                time_elapsed = int(v)
-                break
-        
-        time_extra = 0
-        for tf in ("BH", "BI"):
-            v = f.get(tf, "").strip()
-            if v and v.isdigit():
-                time_extra = int(v)
-                break
-        
-        kickoff_ts = 0
-        try:
-            kickoff_ts = int(f.get("AD", 0))
-        except (ValueError, TypeError):
+            if date_str:
+                kickoff_utc = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        except Exception:
             pass
         
-        return {
+        # Map status
+        status_text = match.get("status", "SCHEDULED")
+        internal_status, status_code = _map_fd_status(status_text)
+        
+        # Get teams
+        home_team = match.get("homeTeam", {})
+        away_team = match.get("awayTeam", {})
+        
+        # Get scores
+        score = match.get("score", {})
+        full_time = score.get("fullTime", {})
+        half_time = score.get("halfTime", {})
+        
+        home_goals = full_time.get("home")
+        away_goals = full_time.get("away")
+        
+        fixtures.append({
+            "match_id": match_id,
+            "api_id": match_id,
+            "home_team": home_team.get("name", "Unknown"),
+            "home_team_id": home_team.get("id", ""),
+            "away_team": away_team.get("name", "Unknown"),
+            "away_team_id": away_team.get("id", ""),
+            "status": internal_status,
             "status_code": status_code,
-            "status": status,
-            "home_score": home_score,
-            "away_score": away_score,
-            "time_elapsed": time_elapsed,
-            "time_extra": time_extra,
-            "kickoff_ts": kickoff_ts,
-        }
+            "status_text": status_text,
+            "kickoff_utc": kickoff_utc,
+            "date_iso": date_str[:10] if date_str else "",
+            "time": date_str[11:16] if date_str else "00:00",
+            "home_score": home_goals if home_goals is not None else 0,
+            "away_score": away_goals if away_goals is not None else 0,
+            "half_time_home": half_time.get("home"),
+            "half_time_away": half_time.get("away"),
+            "venue": match.get("venue", ""),
+            "stage": match.get("stage", ""),
+            "group": match.get("group", ""),
+            "season": match.get("season", {}).get("id", CONFIG.fd_wc_code),
+            "competition": match.get("competition", {}).get("name", "World Cup 2026"),
+        })
     
-    return None
+    return fixtures
 
-def parse_incidents_feed(raw: str) -> List[Dict]:
-    """Parse incidents (goals, cards, subs)"""
-    incidents = []
-    if not raw:
-        return incidents
-    
-    for row in raw.split("~"):
-        row = row.strip()
-        if not row or "INC÷" not in row:
-            continue
-        for segment in row.split("¬"):
-            if not segment.startswith("INC÷"):
-                continue
-            parts = segment[4:].split("÷")
-            if len(parts) < 6:
-                continue
-            try:
-                inc = {
-                    "id": parts[0],
-                    "type": parts[1].upper(),
-                    "minute": int(parts[2]) if parts[2].isdigit() else 0,
-                    "extra": int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0,
-                    "is_home": parts[4] == "1",
-                    "player": _clean(parts[5]) if len(parts) > 5 else "Unknown",
-                    "assist": _clean(parts[6]) if len(parts) > 6 and parts[6].strip() else None,
-                    "sub_out": _clean(parts[7]) if len(parts) > 7 and parts[7].strip() else None,
-                }
-                incidents.append(inc)
-            except (ValueError, IndexError):
-                continue
-    
-    return incidents
-
-def parse_lineups_feed(raw: str) -> Optional[Dict]:
-    """Parse lineups data with debug logging"""
-    if not raw:
-        logger.warning("No raw lineup data received")
+def parse_lineups_response(data: Dict, match_id: str) -> Optional[Dict]:
+    """Parse Football-Data.org /matches/{id}/lineups response"""
+    if not data or "lineups" not in data:
         return None
-    
-    # Log first 500 chars to see what we're getting
-    logger.info(f"📝 Raw lineup response (first 500 chars): {raw[:500]}")
     
     lineups = {
         "home": {"formation": "4-4-2", "players": [], "bench": [], "coach": {"name": "Unknown"}},
         "away": {"formation": "4-4-2", "players": [], "bench": [], "coach": {"name": "Unknown"}},
     }
-    found_any = False
     
-    # Count how many players found
-    home_players_count = 0
-    away_players_count = 0
-    
-    for row in raw.split("~"):
-        row = row.strip()
-        if not row:
-            continue
-            
-        logger.debug(f"Processing row: {row[:200]}")
+    for lineup in data.get("lineups", []):
+        team = lineup.get("team", {})
+        team_id = str(team.get("id", ""))
         
-        for segment in row.split("¬"):
-            segment = segment.strip()
-            if not segment:
-                continue
-            
-            # Look for formation
-            if segment.startswith("LU÷"):
-                parts = segment[3:].split("÷")
-                logger.info(f"🔢 Formation found: {parts}")
-                if len(parts) >= 1 and parts[0]:
-                    lineups["home"]["formation"] = parts[0]
-                if len(parts) >= 2 and parts[1]:
-                    lineups["away"]["formation"] = parts[1]
-            
-            # Look for players
-            elif segment.startswith("PL÷"):
-                parts = segment[3:].split("÷")
-                if len(parts) < 6:
-                    logger.debug(f"PL segment too short: {len(parts)} parts")
-                    continue
-                try:
-                    jersey = int(parts[2]) if parts[2].isdigit() else 0
-                    side = "home" if parts[4] == "1" else "away"
-                    is_starter = parts[5] == "1"
-                    player_name = _clean(parts[1])
-                    
-                    player = {
-                        "name": player_name,
-                        "position": parts[3] or "Unknown",
-                        "jerseyNumber": jersey,
-                        "captain": len(parts) > 7 and parts[7] == "1",
-                        "lineup": is_starter,
-                        "playerId": None,
-                    }
-                    
-                    if is_starter:
-                        lineups[side]["players"].append(player)
-                        if side == "home":
-                            home_players_count += 1
-                        else:
-                            away_players_count += 1
-                    else:
-                        lineups[side]["bench"].append(player)
-                    
-                    found_any = True
-                    logger.info(f"✅ Found player: {player_name} ({side}, starter={is_starter})")
-                    
-                except (ValueError, IndexError) as e:
-                    logger.warning(f"Error parsing PL segment: {e}")
-                    continue
-            
-            # Look for coaches
-            elif segment.startswith("CO÷"):
-                parts = segment[3:].split("÷")
-                if len(parts) >= 3:
-                    side = "home" if parts[2] == "1" else "away"
-                    lineups[side]["coach"]["name"] = _clean(parts[1]) or "Unknown"
-                    logger.info(f"👨‍🏫 Coach found for {side}: {lineups[side]['coach']['name']}")
+        # Determine side
+        # We need to determine if this is home or away
+        # We'll use the data to figure it out later
+        
+        side = "home" if not lineups["home"]["players"] else "away"
+        
+        # Get formation
+        formation_str = lineup.get("formation", "4-4-2")
+        lineups[side]["formation"] = formation_str
+        
+        # Get coach
+        coach = lineup.get("coach", {})
+        lineups[side]["coach"] = {
+            "name": coach.get("name", "Unknown"),
+            "id": str(coach.get("id", ""))
+        }
+        
+        # Get starting XI
+        for player in lineup.get("startingXI", []):
+            player_data = player.get("player", {})
+            lineups[side]["players"].append({
+                "name": player_data.get("name", "Unknown"),
+                "position": player_data.get("position", "Unknown"),
+                "jerseyNumber": player_data.get("shirtNumber", 0),
+                "captain": False,
+                "lineup": True,
+                "playerId": str(player_data.get("id", "")),
+            })
+        
+        # Get substitutes
+        for player in lineup.get("substitutes", []):
+            player_data = player.get("player", {})
+            lineups[side]["bench"].append({
+                "name": player_data.get("name", "Unknown"),
+                "position": player_data.get("position", "Unknown"),
+                "jerseyNumber": player_data.get("shirtNumber", 0),
+                "captain": False,
+                "lineup": False,
+                "playerId": str(player_data.get("id", "")),
+            })
     
-    logger.info(f"📊 Parsing complete - Home players: {home_players_count}, Away players: {away_players_count}")
+    logger.info(f"📊 Parsed lineups - Home: {len(lineups['home']['players'])} players, Away: {len(lineups['away']['players'])} players")
     
-    if found_any and (home_players_count > 0 or away_players_count > 0):
-        logger.info(f"✅ Successfully parsed lineups!")
+    if lineups["home"]["players"] or lineups["away"]["players"]:
         return lineups
     
-    logger.warning(f"❌ No players parsed from lineup feed")
     return None
-
-def parse_statistics_feed(raw: str, time_elapsed: int, time_extra: int, home_score: int, away_score: int) -> Optional[Dict]:
-    """Parse statistics data"""
-    if not raw:
-        return None
-    
-    KEY_MAP = {
-        "possession_home": ("ball_possession_home", "ball_possession_away"),
-        "ball possession": ("ball_possession_home", "ball_possession_away"),
-        "shots_total": ("total_shots_home", "total_shots_away"),
-        "total shots": ("total_shots_home", "total_shots_away"),
-        "shots_on_target": ("shots_on_target_home", "shots_on_target_away"),
-        "shots on target": ("shots_on_target_home", "shots_on_target_away"),
-        "corner_kicks": ("corners_home", "corners_away"),
-        "corner kicks": ("corners_home", "corners_away"),
-        "fouls": ("fouls_home", "fouls_away"),
-        "offsides": ("offsides_home", "offsides_away"),
-        "yellow_cards": ("yellow_cards_home", "yellow_cards_away"),
-        "yellow cards": ("yellow_cards_home", "yellow_cards_away"),
-        "red_cards": ("red_cards_home", "red_cards_away"),
-        "red cards": ("red_cards_home", "red_cards_away"),
-    }
-    
-    stats = {}
-    for row in raw.split("~"):
-        for segment in row.split("¬"):
-            if not segment.startswith("ST÷"):
-                continue
-            parts = segment[3:].split("÷")
-            if len(parts) < 3:
-                continue
-            key = parts[0].lower()
-            mapped = KEY_MAP.get(key)
-            if mapped:
-                try:
-                    stats[mapped[0]] = int(str(parts[1]).replace("%", "").strip())
-                    stats[mapped[1]] = int(str(parts[2]).replace("%", "").strip())
-                except (ValueError, TypeError):
-                    pass
-    
-    if not stats:
-        return None
-    
-    minute_disp = f"{time_elapsed}" + (f"+{time_extra}" if time_extra else "")
-    stats.update({
-        "minute": time_elapsed,
-        "minute_display": minute_disp,
-        "home_score": home_score,
-        "away_score": away_score,
-    })
-    return stats
 
 # ─────────────────────────────────────────────────────────────────────────────
 # BACKEND API COMMUNICATION
@@ -592,7 +445,7 @@ def send_lineups(fixture_id: str, lineups: Dict) -> bool:
         return False
 
 def send_statistics(match_id: str, stats: Dict) -> bool:
-    """Send statistics to backend"""
+    """Send statistics to backend (limited for Football-Data.org free tier)"""
     stats["match_id"] = match_id
     
     try:
@@ -607,43 +460,18 @@ def send_statistics(match_id: str, stats: Dict) -> bool:
         logger.error(f"send_statistics error: {e}")
         return False
 
-def check_lineups_exist(match_id: str) -> bool:
-    """Check if lineups already exist in backend"""
-    try:
-        r = std_requests.get(f"{CONFIG.fanclash_api}/games/{match_id}/lineups", timeout=5)
-        if r.status_code == 200:
-            data = r.json()
-            home_players = data.get("lineups", {}).get("home", {}).get("players", [])
-            away_players = data.get("lineups", {}).get("away", {}).get("players", [])
-            return bool(home_players or away_players)
-        return False
-    except Exception:
-        return False
-
 # ─────────────────────────────────────────────────────────────────────────────
 # LINEUP POLLING (CONTINUOUS WINDOW)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def is_in_lineup_window(minutes_until: float) -> bool:
-    """Check if within 58-53 minute window"""
-    return CONFIG.lineup_poll_start_min <= minutes_until <= CONFIG.lineup_poll_end_min
-
-def get_lineup_poll_deadline(kickoff_utc: datetime) -> float:
-    """Get timestamp for end of lineup polling window"""
-    deadline = kickoff_utc - timedelta(minutes=CONFIG.lineup_poll_end_min)
-    return deadline.timestamp()
-
 def poll_lineups_continuous(fixture: Dict, kickoff_utc: datetime):
     """Poll for lineups continuously until found"""
     match_id = fixture["match_id"]
-    fs_id = fixture.get("flashscore_id") or match_id
     label = f"{fixture['home_team']} vs {fixture['away_team']}"
     
     poll_count = 0
-    start_time = datetime.now(timezone.utc)
     
     logger.info(f"🔍 Starting continuous lineup polling for {label}")
-    logger.info(f"   Flashscore ID: {fs_id}")
     logger.info(f"   Will poll every {CONFIG.lineup_poll_interval_sec} seconds")
     
     with lineup_polling_lock:
@@ -652,26 +480,12 @@ def poll_lineups_continuous(fixture: Dict, kickoff_utc: datetime):
     try:
         while True:
             poll_count += 1
-            elapsed = (datetime.now(timezone.utc) - start_time).total_seconds() / 60
             
-            # Build the URL for debugging
-            query = f"li_{fs_id}_1_en"
-            url = f"{CONFIG.fs_feed_url}{query}"
-            logger.info(f"📋 Lineup poll #{poll_count} - fetching: {url}")
+            # Fetch lineups from Football-Data.org
+            data = fd_get(f"/matches/{match_id}/lineups", base_delay=1.0)
             
-            raw = fs_get(query, base_delay=1.0)
-            
-            if raw:
-                logger.info(f"📥 Got response, length: {len(raw)} chars")
-                
-                # Check if response contains lineup indicators
-                if "PL÷" in raw:
-                    logger.info(f"🎯 Found 'PL÷' in response - lineups should be present!")
-                
-                if "LU÷" in raw:
-                    logger.info(f"🎯 Found 'LU÷' in response - formations should be present!")
-                
-                lineups = parse_lineups_feed(raw)
+            if data:
+                lineups = parse_lineups_response(data, match_id)
                 if lineups and (lineups["home"]["players"] or lineups["away"]["players"]):
                     logger.info(f"✅✅✅ LINEUPS FOUND for {label}! ✅✅✅")
                     logger.info(f"   Home: {len(lineups['home']['players'])} players")
@@ -697,23 +511,18 @@ def poll_lineups_continuous(fixture: Dict, kickoff_utc: datetime):
 # LIVE MATCH POLLING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _find_goal_scorer(incidents: List[Dict], is_home: bool) -> Tuple[str, Optional[str]]:
-    """Find the most recent goal scorer"""
-    for inc in reversed(incidents):
-        if inc["type"] == "G" and inc["is_home"] == is_home:
-            return inc.get("player", "Unknown"), inc.get("assist")
-    return "Unknown", None
-
 def poll_live_match(fixture: Dict):
-    """Main live match polling loop"""
+    """Main live match polling loop using Football-Data.org"""
     match_id = fixture["match_id"]
-    fs_id = fixture.get("flashscore_id") or match_id
     label = f"{fixture['home_team']} vs {fixture['away_team']}"
     
     logger.info(f"🔴 Starting live poll for {label}")
     
     # Get initial state
-    initial = parse_live_feed(fs_get(f"dc_{fs_id}", base_delay=2.0))
+    data = fd_get(f"/matches/{match_id}", base_delay=2.0)
+    fixtures = parse_fixtures_response(data)
+    initial = fixtures[0] if fixtures else None
+    
     if initial and initial["status"] == "completed":
         logger.info(f"Match already completed: {label}")
         update_game_status(match_id, "completed")
@@ -723,16 +532,14 @@ def poll_live_match(fixture: Dict):
     if not fixture.get("lineups_fetched"):
         logger.info(f"📋 Final lineup check for {label} - polling for 3 minutes")
         
-        # Poll for lineups for up to 3 minutes (6 attempts)
         for attempt in range(6):
             logger.info(f"   Lineup check attempt {attempt + 1}/6")
-            raw = fs_get(f"li_{fs_id}_1_en", base_delay=2.0)
-            if raw:
-                lineups = parse_lineups_feed(raw)
+            data = fd_get(f"/matches/{match_id}/lineups", base_delay=2.0)
+            if data:
+                lineups = parse_lineups_response(data, match_id)
                 if lineups and (lineups["home"]["players"] or lineups["away"]["players"]):
                     logger.info(f"✅ LINEUPS FOUND at kickoff for {label}!")
                     if send_lineups(match_id, lineups):
-                        # Update MongoDB
                         if fixture.get("_col"):
                             fixture["_col"].update_one(
                                 {"match_id": match_id},
@@ -740,7 +547,7 @@ def poll_live_match(fixture: Dict):
                             )
                         break
             
-            if attempt < 5:  # Don't sleep after last attempt
+            if attempt < 5:
                 time.sleep(30)
         else:
             logger.warning(f"⚠️ No lineups found for {label} after 3 minutes of polling")
@@ -754,206 +561,110 @@ def poll_live_match(fixture: Dict):
     half_time_sent = False
     full_time_sent = False
     second_half_sent = False
-    seen_incidents = set()
-    last_stats_time = time.time()
     last_commentary_time = time.time()
     
     while True:
         try:
             # Fetch live data
-            live_raw = fs_get(f"dc_{fs_id}", base_delay=1.0)
-            if not live_raw:
+            data = fd_get(f"/matches/{match_id}", base_delay=1.0)
+            if not data or "matches" not in data:
                 time.sleep(CONFIG.poll_interval_sec)
                 continue
             
-            live = parse_live_feed(live_raw)
-            if not live:
+            fixtures_data = parse_fixtures_response(data)
+            if not fixtures_data:
                 time.sleep(CONFIG.poll_interval_sec)
                 continue
             
-            # Fetch incidents
-            incidents_raw = fs_get(f"d_hb_{fs_id}", base_delay=1.0)
-            incidents = parse_incidents_feed(incidents_raw or "")
-            
+            live = fixtures_data[0]
             home_score = live["home_score"]
             away_score = live["away_score"]
             status = live["status"]
             status_code = live["status_code"]
-            time_elapsed = live["time_elapsed"]
-            time_extra = live.get("time_extra", 0)
-            minute_disp = f"{time_elapsed}" + (f"+{time_extra}" if time_extra else "")
+            status_text = live.get("status_text", "SCHEDULED")
             
-            logger.info(f"📊 {label} @ {minute_disp}: {home_score}-{away_score}")
+            # Football-Data.org doesn't provide elapsed time in free tier
+            # We'll track time ourselves
+            minute_disp = "??"
             
-            # Check for goals
+            logger.info(f"📊 {label}: {home_score}-{away_score} ({status_text})")
+            
+            # Check for goals (simplified - FD doesn't provide events in free tier)
             if home_score > last_home:
-                scorer, assist = _find_goal_scorer(incidents, is_home=True)
-                logger.info(f"⚽ GOAL! {fixture['home_team']} - {scorer} ({minute_disp})")
+                logger.info(f"⚽ GOAL! {fixture['home_team']} scores! ({home_score}-{away_score})")
                 
                 send_live_update(match_id, "goal", {
-                    "minute": time_elapsed,
-                    "minute_display": minute_disp,
+                    "minute": 0,
+                    "minute_display": "?",
                     "home_score": home_score,
                     "away_score": away_score,
                     "team": fixture["home_team"],
-                    "player": scorer,
-                    "assist": assist
+                    "player": "Unknown",
                 })
                 
                 send_commentary(match_id, {
-                    "minute": time_elapsed,
-                    "minute_display": minute_disp,
-                    "text": f"⚽ GOAL! {scorer} scores! ({home_score}-{away_score})",
+                    "minute": 0,
+                    "minute_display": "?",
+                    "text": f"⚽ GOAL! {fixture['home_team']} scores! ({home_score}-{away_score})",
                     "event_type": "goal",
                     "home_score": home_score,
                     "away_score": away_score,
                     "team": fixture["home_team"],
-                    "player": scorer,
                 })
                 last_home = home_score
             
             if away_score > last_away:
-                scorer, assist = _find_goal_scorer(incidents, is_home=False)
-                logger.info(f"⚽ GOAL! {fixture['away_team']} - {scorer} ({minute_disp})")
+                logger.info(f"⚽ GOAL! {fixture['away_team']} scores! ({home_score}-{away_score})")
                 
                 send_live_update(match_id, "goal", {
-                    "minute": time_elapsed,
-                    "minute_display": minute_disp,
+                    "minute": 0,
+                    "minute_display": "?",
                     "home_score": home_score,
                     "away_score": away_score,
                     "team": fixture["away_team"],
-                    "player": scorer,
-                    "assist": assist
+                    "player": "Unknown",
                 })
                 
                 send_commentary(match_id, {
-                    "minute": time_elapsed,
-                    "minute_display": minute_disp,
-                    "text": f"⚽ GOAL! {scorer} scores! ({home_score}-{away_score})",
+                    "minute": 0,
+                    "minute_display": "?",
+                    "text": f"⚽ GOAL! {fixture['away_team']} scores! ({home_score}-{away_score})",
                     "event_type": "goal",
                     "home_score": home_score,
                     "away_score": away_score,
                     "team": fixture["away_team"],
-                    "player": scorer,
                 })
                 last_away = away_score
             
-            # Process other incidents
-            for inc in incidents:
-                inc_id = inc.get("id", "")
-                if inc_id in seen_incidents:
-                    continue
-                seen_incidents.add(inc_id)
-                
-                # Prevent memory bloat
-                if len(seen_incidents) > 1000:
-                    seen_incidents.clear()
-                
-                inc_type = inc["type"]
-                if inc_type == "G":  # Already handled goals
-                    continue
-                
-                is_home = inc["is_home"]
-                team = fixture["home_team"] if is_home else fixture["away_team"]
-                minute = inc["minute"]
-                extra = inc.get("extra", 0)
-                m_disp = f"{minute}" + (f"+{extra}" if extra else "")
-                player = inc.get("player", "Unknown")
-                
-                # Yellow Card
-                if inc_type == "YC":
-                    send_live_update(match_id, "yellow_card", {
-                        "minute": minute,
-                        "minute_display": m_disp,
-                        "player": player,
-                        "team": team
-                    })
-                    send_commentary(match_id, {
-                        "minute": minute,
-                        "minute_display": m_disp,
-                        "text": f"🟨 YELLOW CARD - {player} ({team})",
-                        "event_type": "yellow_card",
-                        "home_score": home_score,
-                        "away_score": away_score,
-                        "team": team,
-                        "player": player,
-                    })
-                
-                # Red Card
-                elif inc_type == "RC":
-                    send_live_update(match_id, "red_card", {
-                        "minute": minute,
-                        "minute_display": m_disp,
-                        "player": player,
-                        "team": team
-                    })
-                    send_commentary(match_id, {
-                        "minute": minute,
-                        "minute_display": m_disp,
-                        "text": f"🟥 RED CARD - {player} ({team})",
-                        "event_type": "red_card",
-                        "home_score": home_score,
-                        "away_score": away_score,
-                        "team": team,
-                        "player": player,
-                    })
-                
-                # Substitution
-                elif inc_type == "SB":
-                    p_out = inc.get("sub_out") or "Unknown"
-                    send_live_update(match_id, "substitution", {
-                        "minute": minute,
-                        "minute_display": m_disp,
-                        "player_out": p_out,
-                        "player_in": player,
-                        "team": team
-                    })
-                    send_commentary(match_id, {
-                        "minute": minute,
-                        "minute_display": m_disp,
-                        "text": f"🔄 SUB: {p_out} → {player} ({team})",
-                        "event_type": "substitution",
-                        "home_score": home_score,
-                        "away_score": away_score,
-                        "team": team,
-                    })
-            
-            # Half Time
-            if status_code == 3 and not half_time_sent:
+            # Half Time (detected by status PAUSED)
+            if status_text == "PAUSED" and not half_time_sent:
                 logger.info(f"⏸ HALF TIME: {home_score}-{away_score}")
                 send_live_update(match_id, "half_time", {
-                    "minute": time_elapsed,
-                    "minute_display": f"{time_elapsed}'",
+                    "minute": 0,
+                    "minute_display": "HT",
                     "home_score": home_score,
                     "away_score": away_score
                 })
                 send_commentary(match_id, {
-                    "minute": time_elapsed,
-                    "minute_display": f"{time_elapsed}'",
+                    "minute": 0,
+                    "minute_display": "HT",
                     "text": f"⏸ HALF TIME: {fixture['home_team']} {home_score}-{away_score} {fixture['away_team']}",
                     "event_type": "half_time",
                     "home_score": home_score,
                     "away_score": away_score,
                 })
                 half_time_sent = True
-                
-                # Fetch statistics at half time
-                stats_raw = fs_get(f"od_{fs_id}", base_delay=2.0)
-                if stats_raw:
-                    stats = parse_statistics_feed(stats_raw, time_elapsed, time_extra, home_score, away_score)
-                    if stats:
-                        send_statistics(match_id, stats)
             
             # Second Half Start
-            if status_code == 4 and half_time_sent and not second_half_sent:
+            if status_text == "IN_PLAY" and half_time_sent and not second_half_sent:
                 logger.info("▶️ SECOND HALF STARTED")
                 send_live_update(match_id, "second_half", {
-                    "minute": time_elapsed,
-                    "minute_display": f"{time_elapsed}'"
+                    "minute": 0,
+                    "minute_display": "2H"
                 })
                 send_commentary(match_id, {
-                    "minute": time_elapsed,
-                    "minute_display": f"{time_elapsed}'",
+                    "minute": 0,
+                    "minute_display": "2H",
                     "text": "▶️ SECOND HALF UNDERWAY!",
                     "event_type": "second_half",
                     "home_score": home_score,
@@ -965,14 +676,14 @@ def poll_live_match(fixture: Dict):
             if status == "completed" and not full_time_sent:
                 logger.info(f"🏁 FULL TIME: {home_score}-{away_score}")
                 send_live_update(match_id, "match_end", {
-                    "minute": time_elapsed,
-                    "minute_display": f"{time_elapsed}'",
+                    "minute": 0,
+                    "minute_display": "FT",
                     "home_score": home_score,
                     "away_score": away_score
                 })
                 send_commentary(match_id, {
-                    "minute": time_elapsed,
-                    "minute_display": f"{time_elapsed}'",
+                    "minute": 0,
+                    "minute_display": "FT",
                     "text": f"🏁 FULL TIME: {fixture['home_team']} {home_score}-{away_score} {fixture['away_team']}",
                     "event_type": "full_time",
                     "home_score": home_score,
@@ -981,27 +692,6 @@ def poll_live_match(fixture: Dict):
                 update_game_status(match_id, "completed")
                 full_time_sent = True
                 break
-            
-            # Periodic statistics (every 5 minutes)
-            if time.time() - last_stats_time >= 300:
-                stats_raw = fs_get(f"od_{fs_id}", base_delay=2.0)
-                if stats_raw:
-                    stats = parse_statistics_feed(stats_raw, time_elapsed, time_extra, home_score, away_score)
-                    if stats:
-                        send_statistics(match_id, stats)
-                last_stats_time = time.time()
-            
-            # Periodic commentary heartbeat (every 30 seconds during live play)
-            if time.time() - last_commentary_time >= 30 and status_code in (2, 4):
-                send_commentary(match_id, {
-                    "minute": time_elapsed,
-                    "minute_display": minute_disp,
-                    "text": f"⏱️ Match is underway at {minute_disp}",
-                    "event_type": "heartbeat",
-                    "home_score": home_score,
-                    "away_score": away_score,
-                })
-                last_commentary_time = time.time()
             
             time.sleep(CONFIG.poll_interval_sec)
             
@@ -1064,7 +754,6 @@ def start_polling(fixture: Dict):
             logger.info(f"Already polling {label}")
             return
     
-    # Ensure worker is running
     global queue_worker_started
     with queue_lock:
         if not queue_worker_started:
@@ -1097,31 +786,70 @@ def load_fixtures(col) -> List[Dict]:
     
     fixtures = []
     for f in col.find({"status": {"$ne": "completed"}, "league": CONFIG.world_cup_label}):
-        date_iso = f.get("date_iso", "")
-        time_str = f.get("time", "00:00")
-        kickoff_utc = None
-        
-        if time_str and time_str != "TBD":
+        kickoff_utc = f.get("kickoff_utc")
+        if isinstance(kickoff_utc, str):
             try:
-                naive_eat = datetime.strptime(f"{date_iso} {time_str}", "%Y-%m-%d %H:%M")
-                kickoff_utc = (naive_eat - CONFIG.nairobi_offset).replace(tzinfo=timezone.utc)
+                kickoff_utc = datetime.fromisoformat(kickoff_utc.replace("Z", "+00:00"))
             except Exception:
-                pass
+                kickoff_utc = None
         
         fixtures.append({
             "match_id": f.get("match_id"),
-            "flashscore_id": f.get("flashscore_id"),
+            "api_id": f.get("api_id", f.get("match_id")),
             "home_team": f.get("home_team"),
             "away_team": f.get("away_team"),
+            "home_team_id": f.get("home_team_id", ""),
+            "away_team_id": f.get("away_team_id", ""),
             "status": f.get("status", "upcoming"),
-            "date_iso": date_iso,
-            "time": time_str,
-            "_kickoff_utc": kickoff_utc,
+            "date_iso": f.get("date_iso", ""),
+            "time": f.get("time", "00:00"),
+            "kickoff_utc": kickoff_utc,
             "lineups_fetched": f.get("lineups_fetched", False),
-            "_col": col,  # Store reference for updates
+            "_col": col,
         })
     
-    fixtures.sort(key=lambda x: x["_kickoff_utc"] or datetime.max.replace(tzinfo=timezone.utc))
+    fixtures.sort(key=lambda x: x["kickoff_utc"] or datetime.max.replace(tzinfo=timezone.utc))
+    return fixtures
+
+def update_fixtures_from_api(col):
+    """Fetch fixtures from Football-Data.org and update database"""
+    logger.info("📡 Fetching fixtures from Football-Data.org...")
+    
+    data = fd_get(f"/competitions/{CONFIG.fd_wc_code}/matches")
+    if not data:
+        logger.error("Failed to fetch fixtures from Football-Data.org")
+        return []
+    
+    fixtures = parse_fixtures_response(data)
+    logger.info(f"📋 Found {len(fixtures)} fixtures from API")
+    
+    # Update database
+    for fixture in fixtures:
+        match_id = fixture["match_id"]
+        col.update_one(
+            {"match_id": match_id},
+            {"$set": {
+                "api_id": fixture["api_id"],
+                "home_team": fixture["home_team"],
+                "home_team_id": fixture["home_team_id"],
+                "away_team": fixture["away_team"],
+                "away_team_id": fixture["away_team_id"],
+                "status": fixture["status"],
+                "status_code": fixture["status_code"],
+                "status_text": fixture["status_text"],
+                "date_iso": fixture["date_iso"],
+                "time": fixture["time"],
+                "kickoff_utc": fixture["kickoff_utc"].isoformat() if fixture["kickoff_utc"] else None,
+                "venue": fixture.get("venue", ""),
+                "stage": fixture.get("stage", ""),
+                "group": fixture.get("group", ""),
+                "league": CONFIG.world_cup_label,
+                "competition": fixture.get("competition", "World Cup 2026"),
+                "season": fixture.get("season", CONFIG.fd_wc_code),
+            }},
+            upsert=True
+        )
+    
     return fixtures
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1131,26 +859,21 @@ def load_fixtures(col) -> List[Dict]:
 def calculate_sleep_duration(closest_match: Dict) -> float:
     """Calculate optimal sleep duration based on closest match"""
     if not closest_match:
-        return 3600  # Default 1 hour
+        return 3600
     
-    kickoff = closest_match.get("_kickoff_utc")
+    kickoff = closest_match.get("kickoff_utc")
     if not kickoff:
         return 3600
     
     now = datetime.now(timezone.utc)
     minutes_until = (kickoff - now).total_seconds() / 60
     
-    # More than 3 hours away -> sleep until exactly 3 hours before
     if minutes_until > 180:
         sleep_until = kickoff - timedelta(hours=3)
         sleep_seconds = (sleep_until - now).total_seconds()
-        return max(60, sleep_seconds)  # At least 1 minute
-    
-    # 1-3 hours away -> sleep 1 hour
+        return max(60, sleep_seconds)
     elif minutes_until > 60:
         return 3600
-    
-    # Less than 1 hour -> sleep 30 seconds
     else:
         return 30
 
@@ -1161,6 +884,7 @@ def calculate_sleep_duration(closest_match: Dict) -> float:
 def main():
     logger.info("=" * 65)
     logger.info("🏆 FanClash World Cup 2026 Poller")
+    logger.info("📡 Using Football-Data.org")
     logger.info("=" * 65)
     
     # Start health server
@@ -1169,10 +893,10 @@ def main():
     # Connect to database
     mongo_client, col = connect_db()
     
-    # Load fixtures
-    fixtures = load_fixtures(col)
+    # Fetch fixtures from API
+    fixtures = update_fixtures_from_api(col)
     if not fixtures:
-        logger.warning("No fixtures found. Run scraper first.")
+        logger.warning("No fixtures found from Football-Data.org")
         return
     
     logger.info(f"📋 Loaded {len(fixtures)} fixtures")
@@ -1197,8 +921,8 @@ def main():
                 continue
             
             # Find upcoming matches
-            upcoming = [f for f in fixtures if f.get("_kickoff_utc") and f.get("_kickoff_utc") > now]
-            upcoming.sort(key=lambda x: x["_kickoff_utc"])
+            upcoming = [f for f in fixtures if f.get("kickoff_utc") and f["kickoff_utc"] > now]
+            upcoming.sort(key=lambda x: x["kickoff_utc"])
             
             if not upcoming:
                 logger.info("No upcoming matches, sleeping 1 hour")
@@ -1206,66 +930,54 @@ def main():
                 continue
             
             closest = upcoming[0]
-            minutes_until = (closest["_kickoff_utc"] - now).total_seconds() / 60
+            minutes_until = (closest["kickoff_utc"] - now).total_seconds() / 60
             
             logger.info(f"📅 Next match: {closest['home_team']} vs {closest['away_team']}")
-            logger.info(f"   Kickoff: {closest['_kickoff_utc'].strftime('%Y-%m-%d %H:%M UTC')}")
+            logger.info(f"   Kickoff: {closest['kickoff_utc'].strftime('%Y-%m-%d %H:%M UTC')}")
             logger.info(f"   {minutes_until:.0f} minutes from now")
             
-            # ============================================================
-            # LINEUP POLLING - Start early and poll until found
-            # ============================================================
-            # Start polling at 90 minutes before kickoff
-            if minutes_until <= 90 and minutes_until > 0:
+            # Start lineup polling at 90 minutes before kickoff
+            if minutes_until <= CONFIG.lineup_poll_start_min and minutes_until > 0:
                 match_id = closest['match_id']
                 
-                # Only start if we haven't already started and lineups not yet fetched
                 if match_id not in lineup_polling_started and not closest.get("lineups_fetched"):
                     logger.info(f"🎯 STARTING LINEUP POLLING for {closest['home_team']} vs {closest['away_team']}")
-                    logger.info(f"   {minutes_until:.0f} minutes until kickoff - will poll every 30s until lineups found")
                     
                     threading.Thread(
                         target=poll_lineups_continuous,
-                        args=(closest, closest["_kickoff_utc"]),
+                        args=(closest, closest["kickoff_utc"]),
                         daemon=True
                     ).start()
                     
                     lineup_polling_started.add(match_id)
             
-            # ============================================================
-            # MATCH START WINDOW (5 minutes before and after kickoff)
-            # ============================================================
+            # Match start window
             if minutes_until <= 5:
-                # Update status to "soon" at 5 minutes before
                 if minutes_until > 0 and closest.get("status") != "soon":
-                    logger.info(f"⚽ Match starting soon! Setting status to 'soon'")
+                    logger.info(f"⚽ Match starting soon!")
                     update_game_status(closest["match_id"], "soon", is_live=False)
                 
-                # Start live polling at kickoff (0 minutes)
                 if minutes_until <= 0:
-                    # Update status to live
                     if closest.get("status") != "live":
                         logger.info(f"⚽ MATCH LIVE! Starting poller")
                         update_game_status(closest["match_id"], "live", is_live=True)
                     
-                    # Start the live polling thread
                     start_polling(closest)
-                    
-                    # Small sleep before checking again
                     time.sleep(5)
                     continue
             
-            # ============================================================
-            # SMART SLEEP CALCULATION
-            # ============================================================
-            # If less than 90 minutes until match, sleep 30 seconds to poll frequently
-            if minutes_until <= 90:
+            # Smart sleep
+            if minutes_until <= CONFIG.lineup_poll_start_min:
                 sleep_seconds = 30
             else:
                 sleep_seconds = calculate_sleep_duration(closest)
             
             logger.info(f"💤 Sleeping for {sleep_seconds:.0f} seconds")
             time.sleep(sleep_seconds)
+            
+            # Refresh fixtures periodically (every 15 minutes)
+            if datetime.now(timezone.utc).minute % 15 == 0 and datetime.now(timezone.utc).second < 30:
+                update_fixtures_from_api(col)
             
         except KeyboardInterrupt:
             logger.info("🛑 Shutting down...")
