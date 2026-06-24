@@ -346,6 +346,9 @@ def remove_completed_game(col, match_id: str) -> bool:
     IMMEDIATELY remove a completed game from database.
     Called as soon as a match finishes.
     """
+    if col is None:
+        return False
+        
     result = col.delete_one({
         "match_id": match_id,
         "status": "completed"
@@ -361,6 +364,9 @@ def cleanup_completed_fixtures(col) -> int:
     Clean up any completed fixtures that might still be in DB.
     Called regularly to ensure no completed games linger.
     """
+    if col is None:
+        return 0
+        
     result = col.delete_many({
         "league": CONFIG.world_cup_label,
         "status": "completed"
@@ -414,6 +420,9 @@ def load_fixtures(col) -> List[Dict]:
 
 def update_fixtures_from_api(col) -> List[Dict]:
     """Fetch fixtures from Football-Data.org and update database"""
+    if col is None:
+        return []
+        
     logger.info("📡 Fetching fixtures from Football-Data.org...")
     
     data = fd_get(f"/competitions/{CONFIG.fd_wc_code}/matches")
@@ -481,6 +490,7 @@ def poll_lineups_continuous(fixture: Dict):
     match_id = fixture["match_id"]
     label = f"{fixture['home_team']} vs {fixture['away_team']}"
     poll_count = 0
+    col = fixture.get("_col")
     
     logger.info(f"🔍 Starting lineup polling for {label}")
     
@@ -497,8 +507,8 @@ def poll_lineups_continuous(fixture: Dict):
                 if lineups:
                     logger.info(f"✅✅✅ LINEUPS FOUND for {label}! ✅✅✅")
                     if send_lineups(match_id, lineups):
-                        if fixture.get("_col"):
-                            fixture["_col"].update_one(
+                        if col is not None:
+                            col.update_one(
                                 {"match_id": match_id},
                                 {"$set": {"lineups_fetched": True}}
                             )
@@ -530,7 +540,7 @@ def poll_live_match(fixture: Dict):
     if initial and initial["status"] == "completed":
         logger.info(f"Match already completed: {label}")
         update_game_status(match_id, "completed")
-        if col:
+        if col is not None:
             remove_completed_game(col, match_id)
         return
     
@@ -544,7 +554,7 @@ def poll_live_match(fixture: Dict):
                 if lineups:
                     logger.info(f"✅ LINEUPS FOUND at kickoff for {label}!")
                     if send_lineups(match_id, lineups):
-                        if col:
+                        if col is not None:
                             col.update_one(
                                 {"match_id": match_id},
                                 {"$set": {"lineups_fetched": True}}
@@ -638,7 +648,7 @@ def poll_live_match(fixture: Dict):
                 full_time_sent = True
                 
                 # IMMEDIATELY REMOVE from database
-                if col:
+                if col is not None:
                     remove_completed_game(col, match_id)
                 
                 break
@@ -723,7 +733,7 @@ def main():
     start_health_server()
     
     mongo_client, col = connect_db()
-    if not col:
+    if col is None:
         logger.error("❌ Database connection failed")
         return
     
@@ -817,7 +827,7 @@ def main():
             logger.error(f"Main loop error: {e}")
             time.sleep(60)
     
-    if mongo_client:
+    if mongo_client is not None:
         mongo_client.close()
         logger.info("Database closed")
 
